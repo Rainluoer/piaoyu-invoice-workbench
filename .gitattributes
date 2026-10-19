@@ -1,0 +1,17 @@
+* text=auto eol=lf
+*.py text eol=lf
+*.js text eol=lf
+*.cjs text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.txt text eol=lf
+*.svg text eol=lf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.docx binary
+*.ico binary
+*.png binary
+# 上游脚本按原始字节分发，保持 UPSTREAM.json 中的 SHA256。
+app/vendor/ruku/scripts/*.py -text

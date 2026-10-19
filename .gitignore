@@ -1,0 +1,37 @@
+# 本地票据、台账、生成文档和密钥永不提交
+**/data/
+invoices/**
+!invoices/.gitkeep
+*.sqlite*
+*.db
+*.db-*
+*.pdf
+*.zip
+*.csv
+*.xlsx
+*.xls
+*.docx
+!app/assets/入库单模板.docx
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.lnk
+*.log
+
+# 运行和开发缓存
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

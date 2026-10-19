@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/3450530868/Ruku",
+  "commit": "c6fcc63dd375d866fdb8dfa40cdfd752d0a13ec4",
+  "license": "MIT",
+  "scripts_sha256": {
+    "extract_invoices.py": "1ace821609d0ed99ff629c51df2d27b4b31dfcce3fb46ca173760aa77446c4e4",
+    "rename_files.py": "d36bc5db8cf6a7b3210678308f08ede9266052ff8e5e665d30bc3f37f996d1a6",
+    "fill_receipt.py": "8b7a0ef21c24445814d308dd40c3380d790221ae1e30165a65288927e2923822"
+  }
+}
