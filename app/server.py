@@ -385,18 +385,8 @@ class Store:
             return counts
 
     def documents(self):
-        result = []
-        seen = set()
-        for root in self.managed_roots:
-            for path in self.source_files(root):
-                if path.suffix.lower() != '.docx':
-                    continue
-                resolved = path.resolve()
-                if self.ignored_path(resolved) or resolved in seen or BASE in resolved.parents or self.data_dir in resolved.parents or not resolved.is_relative_to(root):
-                    continue
-                seen.add(resolved)
-                result.append(dict(id=hashlib.sha256(str(path).encode()).hexdigest()[:24], name=path.name, path=str(path), relative=str(path.relative_to(self.root)) if path.is_relative_to(self.root) else str(path), size=path.stat().st_size))
-        return self.receipts.documents() + result
+        # 只展示已完成生成任务的成品，不扫描用户目录中的 Word 文件。
+        return self.receipts.documents()
 
     def state(self):
         with self.lock:

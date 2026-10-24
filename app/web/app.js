@@ -10,7 +10,7 @@ const statusClass=s=>s==='已报销'?'done':'';
 const statusBadge=s=>`<span class="status ${statusClass(s)}"><i></i>${esc(reimbursementStatus(s))}</span>`;
 let state={invoices:[],trash:[],documents:[],events:[]}, view='all', page=1, selected=new Set(), activeId=null, detailPage=1, projectFilter=null, busy=false, drawerReturn=null;
 const pageSize=8;
-const viewNames={all:'发票总览','待报销':'待报销','已报销':'已报销',duplicates:'重复票据',projects:'票据分类',documents:'入库单与文档',settings:'本地设置'};
+const viewNames={all:'发票总览','待报销':'待报销','已报销':'已报销',duplicates:'重复票据',projects:'票据分类',documents:'入库单',settings:'本地设置'};
 function hydrate(){ $$('[data-icon]').forEach(el=>{el.innerHTML=icon(el.dataset.icon);el.removeAttribute('data-icon');}); }
 function toast(text){$('#toast').textContent=text;$('#toast').classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('#toast').classList.remove('show'),5000);}
 async function api(path,body){const options=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-Workbench-Key':state.key},body:JSON.stringify(body)}; const response=await fetch(path,options);const data=await response.json();if(!response.ok)throw Error(data.error||'操作失败');return data;}

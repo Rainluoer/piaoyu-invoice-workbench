@@ -40,13 +40,16 @@ class InvoiceFolderTests(unittest.TestCase):
         self.assertEqual(result['scan']['added'], 1)
         self.assertEqual(len(self.store.state()['invoices']), 2)
         self.assertEqual(self.store.invoice_path(original), original)
-        self.assertTrue(any(doc['name'] == '原有入库单.docx' for doc in self.store.documents()))
+        self.assertEqual(self.store.documents(), [])
+        self.assertEqual((self.old / '原有入库单.docx').read_bytes(), b'old document')
         self.store.db.close()
         self.store = Store(self.old, self.parent / 'app' / 'data')
         self.assertEqual(self.store.root, self.new)
         saved = next(r for r in self.store.state()['invoices'] if r['id'] == row['id'])
         self.assertEqual((saved['project'], saved['notes'], saved['status']), ('原项目', '原备注', '已报销'))
         self.assertEqual(original.read_bytes(), b'old invoice')
+        self.assertEqual(self.store.documents(), [])
+        self.assertEqual((self.old / '原有入库单.docx').read_bytes(), b'old document')
 
     def test_invalid_paths_and_running_generation_do_not_change_settings(self):
         file = self.new / 'not-folder.txt'

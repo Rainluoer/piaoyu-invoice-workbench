@@ -1,12 +1,16 @@
 """生成任务的调度、输入边界和失败处理；真实 ruku 在浏览器验收中执行。"""
 import json
+import hashlib
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from server import Store
+from server import Store, Handler, LocalServer
 
 
 class ReceiptJobTests(unittest.TestCase):
@@ -53,6 +57,50 @@ class ReceiptJobTests(unittest.TestCase):
         self.assertEqual(Path(job['output']).parent.name, '发票')
         self.assertEqual(self.store.documents()[0]['id'], job['document_id'])
         self.assertTrue(all(step['status'] == 'done' for step in job['steps']))
+
+    def test_documents_only_list_registered_outputs_without_scanning_folders(self):
+        external = [self.root / '手工入库单.docx',
+                    self.root / '.qa-temp' / 'receipt-1.docx',
+                    self.root / '工具' / '统计表格.docx',
+                    self.store.receipts.directory / 'unregistered.docx']
+        for path in external:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'external document')
+        with patch('receipt_jobs.subprocess.run', side_effect=self.fake_script):
+            job = self.store.receipts.create([self.row['id']], background=False)
+        with patch.object(self.store, 'source_files', side_effect=AssertionError('must not scan')) as scan:
+            documents = self.store.state()['documents']
+            scan.assert_not_called()
+        self.assertEqual([doc['id'] for doc in documents], [job['document_id']])
+        self.assertTrue(documents[0]['generated'])
+        self.assertTrue(all(path.read_bytes() == b'external document' for path in external))
+        Path(job['output']).unlink()
+        self.assertEqual(self.store.documents(), [])
+
+    def test_document_download_only_serves_generated_receipts(self):
+        external = self.root / '手工入库单.docx'
+        external.write_bytes(b'external document')
+        external_id = hashlib.sha256(str(external).encode()).hexdigest()[:24]
+        with patch('receipt_jobs.subprocess.run', side_effect=self.fake_script):
+            job = self.store.receipts.create([self.row['id']], background=False)
+        server = LocalServer(('127.0.0.1', 0), Handler)
+        server.store = self.store
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f'http://127.0.0.1:{server.server_port}/api/document/'
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(base + job['document_id']) as response:
+                self.assertEqual(response.read(), Path(job['output']).read_bytes())
+                self.assertIn('wordprocessingml.document', response.headers['Content-Type'])
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                opener.open(base + external_id)
+            self.assertEqual(caught.exception.code, 404)
+            self.assertEqual(external.read_bytes(), b'external document')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
 
     def test_incomplete_extraction_does_not_generate_empty_receipt(self):
         def incomplete(command, **kwargs):
