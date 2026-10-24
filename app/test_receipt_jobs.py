@@ -1,13 +1,13 @@
 """生成任务的调度、输入边界和失败处理；真实 ruku 在浏览器验收中执行。"""
 import json
 import hashlib
-import threading
-import urllib.error
-import urllib.request
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+import threading
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 from server import Store, Handler, LocalServer
@@ -35,7 +35,7 @@ class ReceiptJobTests(unittest.TestCase):
         if script == 'extract_invoices.py':
             output = Path(args['--output'])
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(json.dumps([dict(invoice_no='12345678901234567890', total=12.34, original_filename='001.pdf', items=[dict(category='材料', product='零件', quantity=1, amount=10, tax=2.34)])]), encoding='utf-8')
+            output.write_text(json.dumps([dict(invoice_no='12345678901234567890', total=12.34, original_filename='001.pdf', items=[dict(category='材料', product='零件', quantity=1, unit_price=10, amount=10, tax=2.34)])]), encoding='utf-8')
         if script == 'fill_receipt.py':
             Path(args['--output']).write_bytes(b'test output stub')
         return SimpleNamespace(returncode=0, stdout='Chinese: 壹拾贰元叁角肆分\n', stderr='')
@@ -101,6 +101,33 @@ class ReceiptJobTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=3)
+
+    def test_response_read_failure_keeps_running_workers_exclusive_lock(self):
+        entered = threading.Event()
+        proceed = threading.Event()
+        jobs = self.store.receipts
+        def blocked_script(command, **kwargs):
+            if Path(command[1]).name == 'extract_invoices.py':
+                entered.set()
+                if not proceed.wait(timeout=5):
+                    raise RuntimeError('test worker timed out')
+            return self.fake_script(command, **kwargs)
+        with patch('receipt_jobs.subprocess.run', side_effect=blocked_script):
+            try:
+                with patch.object(jobs, 'get', side_effect=RuntimeError('response read failed')):
+                    with self.assertRaisesRegex(RuntimeError, 'response read failed'):
+                        jobs.create([self.row['id']])
+                self.assertTrue(entered.wait(timeout=3))
+                self.assertTrue(jobs.active.locked())
+                with self.assertRaisesRegex(ValueError, '已有入库单正在生成'):
+                    jobs.create([self.row['id']])
+            finally:
+                proceed.set()
+                if jobs.thread:
+                    jobs.thread.join(timeout=5)
+        self.assertFalse(jobs.thread.is_alive())
+        self.assertFalse(jobs.active.locked())
+        self.assertEqual(jobs.recent()[0]['status'], 'done')
 
     def test_incomplete_extraction_does_not_generate_empty_receipt(self):
         def incomplete(command, **kwargs):

@@ -30,13 +30,14 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn('2026 3450530868', (vendor / 'LICENSE').read_text(encoding='utf-8'))
 
     def test_public_template_has_no_personal_metadata_or_external_relationships(self):
-        with ZipFile(server.BASE / 'assets/入库单模板.docx') as package:
-            for name in ('docProps/core.xml', 'docProps/custom.xml'):
-                self.assertEqual(len(ET.fromstring(package.read(name))), 0)
-            self.assertFalse(any(part.startswith(('word/comments', 'word/people', 'word/embeddings')) for part in package.namelist()))
-            for name in package.namelist():
-                if name.endswith('.rels'):
-                    self.assertFalse(any(node.attrib.get('TargetMode') == 'External' for node in ET.fromstring(package.read(name))))
+        for template in ('入库单模板.docx', '统计表格模板.docx'):
+            with self.subTest(template=template), ZipFile(server.BASE / 'assets' / template) as package:
+                for name in ('docProps/core.xml', 'docProps/custom.xml'):
+                    self.assertEqual(len(ET.fromstring(package.read(name))), 0)
+                self.assertFalse(any(part.startswith(('word/comments', 'word/people', 'word/embeddings', 'docProps/thumbnail')) for part in package.namelist()))
+                for name in package.namelist():
+                    if name.endswith('.rels'):
+                        self.assertFalse(any(node.attrib.get('TargetMode') == 'External' for node in ET.fromstring(package.read(name))))
 
     def test_startup_uses_project_invoice_directory_and_explicit_ignore_paths(self):
         with TemporaryDirectory() as directory, \

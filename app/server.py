@@ -25,6 +25,10 @@ from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
 from receipt_jobs import ReceiptJobs
+from invoice_company import seller_from_text, company_from_pdf, company_needs_repair, PDFIUM_LOCK
+from pdf_layout import layout_text
+from invoice_extract import from_pages
+from pdf_layout import layout_lines
 
 BASE = Path(__file__).resolve().parent
 EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg'}
@@ -88,11 +92,7 @@ def parse_text(text, filename):
     title = (items[0][0] + ' · ' + re.split(r'\s{2,}|\s+\d', items[0][1])[0].strip()) if items else Path(filename).stem
     if '铁路' in text or '铁路' in filename:
         title = '铁路电子客票'
-    seller = ''
-    # 部分票面把购销双方并列排版；只读取带明确标签的销售方。
-    seller_match = re.search(r'销售方(?:名称)?[：:]\s*([^\n]+)', text)
-    if seller_match:
-        seller = seller_match.group(1).strip()[:100]
+    seller = seller_from_text(text)
     return dict(invoice_no=number, date=date, amount_cents=cents, title=title[:160], seller=seller)
 
 
@@ -141,6 +141,8 @@ class Store:
         self.db.commit()
         version = self.db.execute("SELECT value FROM meta WHERE key='parser_version'").fetchone()
         self.parser_changed = not version or version[0] != '3'
+        company_version = self.db.execute("SELECT value FROM meta WHERE key='company_parser_version'").fetchone()
+        self.company_parser_changed = not company_version or company_version[0] != '2'
         self.receipts = ReceiptJobs(self)
 
     def event(self, id_, action, detail):
@@ -244,6 +246,13 @@ class Store:
         if old and old['deleted_at']:
             return 'skipped'
         if old and old['mtime_ns'] == stat.st_mtime_ns and old['size'] == stat.st_size and not self.parser_changed:
+            if self.company_parser_changed and (not old['seller'] or company_needs_repair(old['seller'])):
+                seller = seller_from_text(old['text'])
+                if not seller and path.suffix.lower() == '.pdf':
+                    seller = company_from_pdf(path)
+                if seller:
+                    self.db.execute('UPDATE invoices SET seller=?,updated_at=? WHERE id=?', (seller, now(), old['id']))
+                    return 'updated'
             return 'unchanged'
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if not old:
@@ -255,12 +264,20 @@ class Store:
                 self.event(moved['id'], '路径更新', source)
                 return 'updated'
         text, warning, page_count = '', '', 1
+        reconstructed = None
         if path.suffix.lower() == '.pdf':
             try:
                 import pdfplumber
                 with pdfplumber.open(path) as pdf:
                     page_count = len(pdf.pages)
                     text = '\n'.join(p.extract_text() or '' for p in pdf.pages[:8])[:60000]
+                    initial = parse_text(text, path.name)
+                    if initial['amount_cents'] is None or not initial['invoice_no'] or not initial['date']:
+                        try:
+                            reconstructed = from_pages([layout_lines(p) for p in pdf.pages[:8]])
+                            text = '\n'.join(layout_text(p) for p in pdf.pages[:8])[:60000]
+                        except ValueError:
+                            pass
                 if not text.strip():
                     warning = '无可提取文字，请手动核对'
             except ImportError:
@@ -270,6 +287,10 @@ class Store:
         else:
             warning = '图片票据，请手动填写信息'
         fields = parse_text(text, path.name)
+        if reconstructed:
+            fields['title'] = (reconstructed['items'][0]['category'] + ' · ' + reconstructed['items'][0]['product'])[:160]
+        if not fields['seller'] and path.suffix.lower() == '.pdf':
+            fields['seller'] = company_from_pdf(path)
         # 已有入库单数据是补充来源，优先用票面号码匹配，避免靠金额猜测。
         record = metadata.get(fields['invoice_no'])
         if record:
@@ -286,6 +307,8 @@ class Store:
             self.db.execute('UPDATE invoices SET sha256=?,mtime_ns=?,size=?,text=?,warning=?,page_count=?,updated_at=? WHERE id=?', (digest, stat.st_mtime_ns, stat.st_size, text, warning, page_count, now(), id_))
             if not old['manual']:
                 self.db.execute('UPDATE invoices SET title=?,invoice_no=?,date=?,amount_cents=?,seller=? WHERE id=?', (*[fields[k] for k in ('title', 'invoice_no', 'date', 'amount_cents', 'seller')], id_))
+            elif (not old['seller'] or company_needs_repair(old['seller'])) and fields['seller']:
+                self.db.execute('UPDATE invoices SET seller=? WHERE id=?', (fields['seller'], id_))
             return 'updated'
         classification_source = source if source.startswith('手动导入') else str(self.root / source)
         status = '已报销' if '已报销' in Path(classification_source).parts else '待报销'
@@ -359,8 +382,10 @@ class Store:
                         counts[self.ingest(path, '手动导入', meta)] += 1
             self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('last_scan', now()))
             self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('parser_version', '3'))
+            self.db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', ('company_parser_version', '2'))
             self.db.commit()
             self.parser_changed = False
+            self.company_parser_changed = False
             return dict(**counts, errors=errors)
 
     def upload(self, name, encoded):
@@ -652,12 +677,15 @@ class Handler(BaseHTTPRequestHandler):
         route, query = request.path, parse_qs(request.query)
         try:
             if route == '/api/health':
+                # 就绪检查不读取台账、遍历文档或等待扫描/生成的数据库锁。
                 return self.send({'app': 'piaoyu-invoice-workbench', 'data_dir': str(self.store.data_dir)})
             if route == '/api/state':
                 return self.send(self.store.state())
             if route.startswith('/api/category-history/'):
                 return self.send(self.store.category_history(route.rsplit('/', 1)[-1]))
             if route.startswith('/api/receipt-jobs/'):
+                if route.endswith('/statistics'):
+                    return self.send(self.store.receipts.statistics_data(route.split('/')[-2]))
                 if route.endswith('/manual'):
                     return self.send(self.store.receipts.manual_data(route.split('/')[-2]))
                 return self.send(self.store.receipts.get(route.rsplit('/', 1)[-1]))
@@ -677,7 +705,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not output.exists():
                         import pdfplumber
                         with pdfplumber.open(row['path']) as pdf:
-                            picture = pdf.pages[page - 1].to_image(resolution=125).original
+                            with PDFIUM_LOCK:
+                                picture = pdf.pages[page - 1].to_image(resolution=125).original
                             picture.save(output, format='PNG')
                 return self.send(output.read_bytes(), 'image/png')
             if route.startswith('/api/file/'):
@@ -690,7 +719,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(file.read_bytes(), mimetypes.guess_type(file.name)[0] or 'application/octet-stream', filename=file.name if 'download' in query else None)
             if route.startswith('/api/document/'):
                 id_ = route.rsplit('/', 1)[-1]
-                doc = next((d for d in self.store.documents() if d['id'] == id_), None)
+                documents = self.store.documents()
+                downloads = documents + [doc['statistics'] for doc in documents if doc.get('statistics')]
+                doc = next((d for d in downloads if d['id'] == id_), None)
                 if not doc:
                     return self.send({'error': '文档不存在'}, status=404)
                 return self.send(Path(doc['path']).read_bytes(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', filename=doc['name'])
@@ -709,7 +740,7 @@ class Handler(BaseHTTPRequestHandler):
                     fields = [row['title'], row['invoice_no'], row['date'], '' if row['amount_cents'] is None else f"{row['amount_cents']/100:.2f}", row['category'], row['status'], row['project'], row['seller'], row['notes'], row['path'], '是' if row['duplicate_of'] else '否']
                     writer.writerow([cell(v) for v in fields])
                 return self.send(b'\xef\xbb\xbf' + out.getvalue().encode(), 'text/csv; charset=utf-8', filename='发票台账.csv')
-            assets = {'/': 'index.html', '/app.js': 'app.js', '/receipts.js': 'receipts.js', '/folders.js': 'folders.js', '/categories.js': 'categories.js', '/themes.js': 'themes.js', '/themes.css': 'themes.css', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg'}
+            assets = {'/': 'index.html', '/app.js': 'app.js', '/receipts.js': 'receipts.js', '/statistics.js': 'statistics.js', '/folders.js': 'folders.js', '/categories.js': 'categories.js', '/themes.js': 'themes.js', '/themes.css': 'themes.css', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg'}
             if route in assets:
                 path = BASE / 'web' / assets[route]
                 return self.send(path.read_bytes(), mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
@@ -736,6 +767,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(self.store.scan())
             if self.path == '/api/receipt-jobs':
                 return self.send(self.store.receipts.create(body.get('ids')))
+            if self.path.startswith('/api/receipt-jobs/') and self.path.endswith('/statistics'):
+                return self.send(self.store.receipts.save_statistics(self.path.split('/')[-2], body.get('rows')))
             if self.path.startswith('/api/receipt-jobs/') and self.path.endswith('/manual'):
                 return self.send(self.store.receipts.save_manual(self.path.split('/')[-2], body.get('invoices'), resume=body.get('resume') is True))
             if self.path == '/api/update':

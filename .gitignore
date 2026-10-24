@@ -12,6 +12,7 @@ invoices/**
 *.xls
 *.docx
 !app/assets/入库单模板.docx
+!app/assets/统计表格模板.docx
 .env
 .env.*
 !.env.example

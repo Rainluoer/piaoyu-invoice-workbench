@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>票屿 · 本地发票工作台</title><link rel="icon" href="/favicon.svg"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/themes.css"><script src="/themes.js"></script><script defer src="/app.js"></script><script defer src="/receipts.js"></script><script defer src="/folders.js"></script><script defer src="/categories.js"></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>票屿 · 本地发票工作台</title><link rel="icon" href="/favicon.svg"><link rel="stylesheet" href="/style.css"><link rel="stylesheet" href="/themes.css"><script src="/themes.js"></script><script defer src="/app.js"></script><script defer src="/receipts.js"></script><script defer src="/statistics.js"></script><script defer src="/folders.js"></script><script defer src="/categories.js"></script></head>
 <body>
 <div class="app-shell">
   <aside class="sidebar">
@@ -37,5 +37,6 @@
 <dialog id="delete-confirm-dialog" aria-labelledby="delete-confirm-title" aria-describedby="delete-confirm-message delete-confirm-note"><div class="dialog-heading"><h2 id="delete-confirm-title">确认删除票据</h2></div><p id="delete-confirm-message"></p><p id="delete-confirm-note">票据将移入本地回收站，可以恢复。</p><form method="dialog" class="delete-confirm-actions"><button class="button" value="cancel" autofocus>取消</button><button class="button danger" value="confirm">确认删除</button></form></dialog>
 <dialog id="category-dialog" aria-labelledby="category-dialog-title"><div class="dialog-heading"><h2 id="category-dialog-title">修改发票类型</h2><button class="icon-button" id="close-category-dialog" aria-label="关闭类型修改">×</button></div><div id="category-editor-body"></div></dialog>
 <dialog id="receipt-manual-dialog" aria-labelledby="receipt-manual-title"><div class="dialog-heading"><h2 id="receipt-manual-title">补填发票信息</h2><button class="icon-button" id="close-receipt-manual" aria-label="关闭补填窗口">×</button></div><div id="receipt-manual-body"></div></dialog>
+<dialog id="statistics-dialog" aria-labelledby="statistics-title"><div class="dialog-heading"><h2 id="statistics-title">统计表格</h2><button class="icon-button" id="close-statistics" aria-label="关闭统计表格">×</button></div><div id="statistics-body"></div></dialog>
 <div id="toast" role="status" aria-live="polite"></div>
 </body></html>

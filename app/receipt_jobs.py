@@ -15,6 +15,9 @@ import subprocess
 import sys
 import threading
 from receipt_layout import clean_receipt, blank_receipt_fields
+from statistics_table import rows_from_invoices, validate_rows, write_statistics
+from invoice_company import seller_from_text, company_from_pdf, company_needs_repair
+from invoice_extract import repair_extraction, ExtractionRepairError, check_invoice
 
 MAX_RECEIPTS = 5
 LAYOUT_VERSION = 3
@@ -134,6 +137,18 @@ class ReceiptJobs:
                 extracted = {inv.get('original_filename'): inv for inv in content if isinstance(inv, dict)}
         except (OSError, ValueError):
             pass
+        # 老失败任务也使用当前适配层；只读重建，不覆盖已保存的人工草稿。
+        copies = Path(job['output']).parent
+        for index, source in enumerate(job['sources'], 1):
+            if hashlib.sha256((copies / f'{index:03d}.pdf').read_bytes()).hexdigest() != source['sha256']:
+                raise ValueError('任务中的发票副本已变化，请重新生成')
+        try:
+            refreshed, _ = repair_extraction(list(extracted.values()), copies, [f'{i:03d}.pdf' for i in range(1, len(job['sources']) + 1)])
+        except ExtractionRepairError as error:
+            refreshed = error.invoices
+        except ValueError:
+            refreshed = []
+        extracted.update({inv['original_filename']: inv for inv in refreshed})
         with self.store.lock:
             records = {row['id']: dict(row) for row in self.store.db.execute('SELECT id,invoice_no,amount_cents FROM invoices')}
         invoices = []
@@ -144,9 +159,14 @@ class ReceiptJobs:
             if total is None and row.get('amount_cents') is not None:
                 total = f"{row['amount_cents']/100:.2f}"
             items = inv.get('items') or [{}]
+            try:
+                check_invoice(inv)
+                complete = True
+            except ValueError:
+                complete = False
             invoices.append(dict(source_id=source['id'], filename=source['filename'],
                 invoice_no=inv.get('invoice_no') or row.get('invoice_no', ''), total='' if total is None else str(total),
-                extracted_complete=bool(inv.get('invoice_no') and inv.get('total') is not None and inv.get('items')),
+                extracted_complete=complete, extraction_error=inv.get('_extraction_error', ''),
                 items=[{field: '' if item.get(field) is None else str(item.get(field, ''))
                         for field in ('category', 'product', 'spec', 'unit', 'quantity', 'unit_price', 'amount', 'tax')}
                        for item in items if isinstance(item, dict)]))
@@ -333,6 +353,81 @@ class ReceiptJobs:
             self._save(job)
             return False
 
+    def _statistics_path(self, job):
+        return self._job_directory(job) / '发票' / '统计表格.docx'
+
+    def _statistics_rows(self, job):
+        work = self._job_directory(job)
+        invoices = json.loads((work / '入库单数据' / 'invoice_data.json').read_text(encoding='utf-8'))
+        with self.store.lock:
+            records = {row['id']: dict(row) for row in self.store.db.execute('SELECT id,path,sha256,seller,text FROM invoices')}
+        sellers = {}
+        for index, source in enumerate(job['sources'], 1):
+            record = records.get(source['id'], {})
+            if record.get('sha256') != source['sha256']:
+                record = {}
+            seller = next((value for value in (record.get('seller'), source.get('seller'), seller_from_text(record.get('text', ''))) if value and not company_needs_repair(value)), '')
+            if not seller:
+                candidates = [Path(record.get('path') or source['path'])]
+                candidates.extend((work / '发票').glob('*.pdf'))
+                for path in candidates:
+                    try:
+                        if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == source['sha256']:
+                            seller = company_from_pdf(path)
+                            if seller:
+                                break
+                    except OSError:
+                        continue
+            sellers[f'{index:03d}.pdf'] = seller
+        return rows_from_invoices(invoices, sellers)
+
+    def statistics_data(self, id_):
+        job = self.get(id_)
+        if job['status'] != 'done':
+            raise ValueError('请先完成入库单生成，再编辑统计表格')
+        expected = self._statistics_rows(job)
+        rows = validate_rows(job['statistics_rows'], expected) if 'statistics_rows' in job else expected
+        return {'job_id': id_, 'rows': rows}
+
+    def _write_statistics(self, job, rows):
+        output = self._statistics_path(job)
+        temporary = output.with_name('.statistics-' + secrets.token_hex(8) + '.docx')
+        try:
+            write_statistics(temporary, rows)
+            temporary.replace(output)
+        finally:
+            temporary.unlink(missing_ok=True)
+        job.update(statistics_rows=rows, statistics_document_id=hashlib.sha256(str(output).encode()).hexdigest()[:24], statistics_error='')
+
+    def save_statistics(self, id_, rows):
+        if not self.active.acquire(blocking=False):
+            raise ValueError('入库单正在生成，请稍后编辑统计表格')
+        try:
+            job = self.get(id_)
+            if job['status'] != 'done':
+                raise ValueError('请先完成入库单生成')
+            clean = validate_rows(rows, self._statistics_rows(job))
+            output = self._statistics_path(job)
+            previous = output.read_bytes() if output.is_file() else None
+            self._write_statistics(job, clean)
+            try:
+                self._save(job, audit=('修改统计表格', f'任务 {id_}，{len(clean)} 项商品'))
+            except Exception:
+                # 审计和草稿保存失败时恢复旧成品，避免文件与数据库不一致。
+                if previous is None:
+                    output.unlink(missing_ok=True)
+                else:
+                    temporary = output.with_name('.statistics-rollback-' + secrets.token_hex(8) + '.docx')
+                    try:
+                        temporary.write_bytes(previous)
+                        temporary.replace(output)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                raise
+            return self.get(id_)
+        finally:
+            self.active.release()
+
     def documents(self):
         with self.store.lock:
             jobs = [json.loads(row['payload']) for row in self.store.db.execute('SELECT payload FROM receipt_jobs ORDER BY created_at DESC')]
@@ -343,7 +438,9 @@ class ReceiptJobs:
             path = Path(job['output']).resolve()
             if not path.is_relative_to(self.directory.resolve()) or not path.is_file():
                 continue
-            result.append(dict(id=job['document_id'], name=path.name, path=str(path), relative=str(path.relative_to(self.store.root)) if path.is_relative_to(self.store.root) else str(path), size=path.stat().st_size, generated=True, created_at=job['created_at'], invoice_count=job['invoice_count'], item_count=job['item_count'], total_cents=job['total_cents']))
+            statistics = self._statistics_path(job)
+            attachment = dict(id=job['statistics_document_id'], name=statistics.name, path=str(statistics), size=statistics.stat().st_size) if job.get('statistics_document_id') and statistics.is_file() else None
+            result.append(dict(id=job['document_id'], name=path.name, path=str(path), relative=str(path.relative_to(self.store.root)) if path.is_relative_to(self.store.root) else str(path), size=path.stat().st_size, generated=True, created_at=job['created_at'], invoice_count=job['invoice_count'], item_count=job['item_count'], total_cents=job['total_cents'], job_id=job['id'], statistics=attachment, statistics_error=job.get('statistics_error', '')))
         return result
 
     def create(self, ids, background=True):
@@ -355,6 +452,7 @@ class ReceiptJobs:
             raise ValueError(available['reason'])
         if not self.active.acquire(blocking=False):
             raise ValueError('已有入库单正在生成，请等待完成')
+        handed_off = False
         try:
             with self.store.lock:
                 records = {row['id']: row for row in self.store.state()['invoices']}
@@ -364,21 +462,20 @@ class ReceiptJobs:
                     if not row or row['duplicate_of'] or row['missing'] or row['category'] != '科研材料' or Path(row['path']).suffix.lower() != '.pdf':
                         raise ValueError('只能选择有效、非重复的科研材料 PDF 发票')
                     path = self.store.invoice_path(row['path'])
-                    sources.append({'id': id_, 'path': str(path), 'filename': row['filename'], 'sha256': row['sha256']})
+                    sources.append({'id': id_, 'path': str(path), 'filename': row['filename'], 'sha256': row['sha256'], 'seller': row['seller']})
             job_id = datetime.now().strftime('%Y%m%d-%H%M%S-') + secrets.token_hex(4)
             work = self.directory / job_id
             job = dict(id=job_id, status='running', stage=0, created_at=timestamp(), updated_at=timestamp(), sources=sources, invoice_count=len(sources), item_count=0, total_cents=0, chinese_total='', error='', output=str(work / '发票' / '入库单_已填写.docx'), data_path=str(work / '入库单数据' / 'invoice_data.json'), steps=[{'title': name, 'status': 'pending', 'summary': '', 'log': ''} for name in ('提取发票信息', '重命名发票副本', '生成入库单')])
             self._save(job)
             if background:
-                if not self._start(job):
-                    self.active.release()
+                handed_off = self._start(job)
             else:
+                handed_off = True
                 self._run(job)
             return self.get(job_id)
-        except Exception:
-            if self.active.locked():
+        finally:
+            if not handed_off:
                 self.active.release()
-            raise
 
     def _run(self, job, resume=False):
         try:
@@ -413,6 +510,20 @@ class ReceiptJobs:
                     raise ValueError(f"第 {index + 1} 步失败：{(result.stderr or result.stdout).strip()[-800:]}")
                 if index == 0:
                     invoices = json.loads(data.read_text(encoding='utf-8'))
+                    repair_error = None
+                    try:
+                        invoices, repaired = repair_extraction(invoices, invoice_dir, [f'{i:03d}.pdf' for i in range(1, len(job['sources']) + 1)])
+                    except ExtractionRepairError as error:
+                        invoices, repaired, repair_error = error.invoices, error.repaired, error
+                    if repaired or repair_error:
+                        original = data.with_name('invoice_data_extracted.json')
+                        if not original.exists():
+                            original.write_bytes(data.read_bytes())
+                        data.write_text(json.dumps(invoices, ensure_ascii=False, indent=2), encoding='utf-8')
+                        job['layout_repaired_files'] = repaired
+                        step['log'] += '\n按横向文字及列位置重新识别并校验：' + '、'.join(repaired)
+                    if repair_error:
+                        raise repair_error
                     # 不接受脚本缺失字段时的空白或 0 元占位结果。
                     if len(invoices) != len(job['sources']) or any(not inv.get('invoice_no') or inv.get('total') is None or not inv.get('items') for inv in invoices):
                         raise ValueError('部分发票未识别出完整票号、商品或金额，请补填发票信息后继续生成')
@@ -436,6 +547,11 @@ class ReceiptJobs:
                     step['summary'] = f"已生成 {job['item_count']} 项商品，{self._amount_summary(job)}"
                 step['status'] = 'done'
                 self._save(job)
+            try:
+                self._write_statistics(job, self._statistics_rows(job))
+            except Exception as error:
+                # 统计表失败不丢弃已完成的入库单；允许稍后在编辑入口重试。
+                job['statistics_error'] = f'入库单已生成，统计表格未能生成：{error}'
             job['status'] = 'done'
             job['layout_version'] = LAYOUT_VERSION
             self._save(job)
