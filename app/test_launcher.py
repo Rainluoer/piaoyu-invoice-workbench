@@ -28,9 +28,11 @@ class LauncherTests(unittest.TestCase):
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def tearDown(self):
+        pid = None
         try:
-            with self.opener.open(self.url + '/stop', timeout=0.5):
-                pass
+            with self.opener.open(self.url + '/stop', timeout=0.5) as response:
+                # 在关闭监听端口之外，还要等待解释器释放日志及虚拟环境可执行文件。
+                pid = json.load(response)['pid']
             for _ in range(30):
                 try:
                     with self.opener.open(self.url + '/api/state', timeout=0.1):
@@ -40,12 +42,27 @@ class LauncherTests(unittest.TestCase):
                 time.sleep(0.05)
         except OSError:
             pass
+        if os.name == 'nt' and pid is not None:
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
+            kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = kernel.OpenProcess(0x00100000, False, pid)
+            if handle:
+                try:
+                    self.assertEqual(kernel.WaitForSingleObject(handle, 10000), 0, 'synthetic service did not exit')
+                finally:
+                    kernel.CloseHandle(handle)
         # Windows 上监听端口关闭后，解释器还可能短暂持有日志文件句柄。
         for _ in range(40):
             try:
                 self.temp.cleanup()
                 return
-            except PermissionError:
+            except (PermissionError, NotADirectoryError):
                 time.sleep(0.05)
         self.temp.cleanup()
 
