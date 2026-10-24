@@ -651,6 +651,8 @@ class Handler(BaseHTTPRequestHandler):
         request = urlparse(self.path)
         route, query = request.path, parse_qs(request.query)
         try:
+            if route == '/api/health':
+                return self.send({'app': 'piaoyu-invoice-workbench', 'data_dir': str(self.store.data_dir)})
             if route == '/api/state':
                 return self.send(self.store.state())
             if route.startswith('/api/category-history/'):
