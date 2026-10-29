@@ -2,7 +2,7 @@
 let editingCategoryId = null, savingCategory = false;
 
 function categoryOptions(){
-  return ['其他票据','出行交通','科研材料','铁路客票'];
+  return ['其他票据','出行交通','科研材料','铁路客票','住宿费'];
 }
 function categorySelectOptions(current){
   const options=categoryOptions();

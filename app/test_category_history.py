@@ -27,16 +27,17 @@ class CategoryHistoryTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_type_and_before_after_history_persist_after_rescan_restart_and_backup(self):
+        self.assertEqual(self.store.state()['categories'], ['其他票据', '出行交通', '科研材料', '铁路客票', '住宿费'])
         self.store.update([self.row['id']], {'category': '科研材料'})
-        self.store.update([self.row['id']], {'category': '出行交通'})
+        self.store.update([self.row['id']], {'category': '住宿费'})
         self.store.scan()
         self.store.db.close()
         self.store = Store(self.root, self.root / 'app' / 'data')
         saved = self.store.state()['invoices'][0]
-        self.assertEqual(saved['category'], '出行交通')
+        self.assertEqual(saved['category'], '住宿费')
         self.assertEqual(saved['status'], self.row['status'])
         history = self.store.category_history(self.row['id'])
-        self.assertEqual([(item['before'], item['after']) for item in history], [('科研材料', '出行交通'), ('其他票据', '科研材料')])
+        self.assertEqual([(item['before'], item['after']) for item in history], [('科研材料', '住宿费'), ('其他票据', '科研材料')])
         self.assertTrue(all(item['created_at'] for item in history))
         self.assertEqual(self.original.read_bytes(), b'original invoice')
         backup = self.store.backup()

@@ -35,7 +35,7 @@ EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg'}
 MAX_FILE = 40 * 1024 * 1024
 MAX_ZIP = 200 * 1024 * 1024
 STATUSES = {'待报销', '报销中', '已报销'}
-CATEGORIES = {'其他票据', '出行交通', '科研材料', '铁路客票'}
+CATEGORIES = ('其他票据', '出行交通', '科研材料', '铁路客票', '住宿费')
 IGNORED_DIRECTORIES = ()
 
 
@@ -94,6 +94,18 @@ def parse_text(text, filename):
         title = '铁路电子客票'
     seller = seller_from_text(text)
     return dict(invoice_no=number, date=date, amount_cents=cents, title=title[:160], seller=seller)
+
+
+def is_itinerary(row):
+    """识别作为附件的行程单，不因发票备注提及行程单而隐藏真正发票。"""
+    lines = [re.sub(r'\s+', '', line) for line in (row.get('text') or '').splitlines() if line.strip()]
+    if any(re.match(r'^(?:电子发票|增值税.{0,24}发票)', line) for line in lines[:8]):
+        return False
+    names = ' '.join(row.get(field) or '' for field in ('filename', 'title'))
+    if re.search(r'行\s*程\s*单|\bitinerary\b', names, re.I):
+        return True
+    return any((('行程单' in line and len(line) < 80 and not line.startswith(('备注', '说明', '温馨提示')))
+                or line.upper() in ('ITINERARY', 'AMAPITINERARY')) for line in lines[:3])
 
 
 class Store:
@@ -416,7 +428,7 @@ class Store:
     def state(self):
         with self.lock:
             rows = [dict(r) for r in self.db.execute("SELECT * FROM invoices WHERE deleted_at='' ORDER BY created_at,id")]
-            rows = [row for row in rows if not self.ignored_invoice(row)]
+            rows = [row for row in rows if not self.ignored_invoice(row) and not is_itinerary(row)]
             rows.sort(key=lambda r: not Path(r['path']).is_file())
             hashes, numbers = {}, {}
             for row in rows:
@@ -431,7 +443,7 @@ class Store:
             last = self.db.execute("SELECT value FROM meta WHERE key='last_scan'").fetchone()
             events = [dict(r) for r in self.db.execute('SELECT e.*,i.title FROM events e LEFT JOIN invoices i ON i.id=e.invoice_id ORDER BY e.id DESC LIMIT 30')]
             trash = [dict(r) for r in self.db.execute("SELECT id,title,filename,path,invoice_no,status,deleted_at FROM invoices WHERE deleted_at<>'' ORDER BY deleted_at DESC,id")]
-            return dict(invoices=rows, trash=trash, documents=self.documents(), receipt_jobs=self.receipts.recent(), receipt_skill=self.receipts.availability(), root=str(self.root), managed_roots=[str(path) for path in self.managed_roots], root_available=self.root.is_dir(), data_dir=str(self.data_dir), last_scan=last[0] if last else '', events=events, key=self.key)
+            return dict(invoices=rows, categories=list(CATEGORIES), trash=trash, documents=self.documents(), receipt_jobs=self.receipts.recent(), receipt_skill=self.receipts.availability(), root=str(self.root), managed_roots=[str(path) for path in self.managed_roots], root_available=self.root.is_dir(), data_dir=str(self.data_dir), last_scan=last[0] if last else '', events=events, key=self.key)
 
     def checked_ids(self, ids):
         if not isinstance(ids, list) or not ids or len(ids) > 2000 or any(not isinstance(id_, str) for id_ in ids):
@@ -587,7 +599,7 @@ class Store:
                     raise ValueError('字段格式或长度不正确')
                 values[field] = value.strip()
         if 'category' in values and values['category'] not in CATEGORIES:
-            raise ValueError('请选择其他票据、出行交通、科研材料或铁路客票')
+            raise ValueError('请选择其他票据、出行交通、科研材料、铁路客票或住宿费')
         if 'status' in values and values['status'] not in STATUSES:
             raise ValueError('不支持的报销状态')
         if values.get('date'):

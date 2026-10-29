@@ -34,4 +34,7 @@ assert.ok(ids().every(id => !id.startsWith('copy-')));
 inputs['#status-filter'].value = '待报销';
 assert.deepEqual(ids(), ['original-pending', 'original-submitted']);
 assert.equal(context.canonical().length, 3);
+context.state.invoices.push(row('lodging', '待报销', {category: '住宿费'}));
+inputs['#category-filter'].value = '住宿费';
+assert.deepEqual(ids(), ['lodging']);
 console.log('PASS: two-state filters exclude duplicate copies and include legacy unfinished records as pending.');
