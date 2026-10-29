@@ -28,6 +28,7 @@ from receipt_jobs import ReceiptJobs
 from invoice_company import seller_from_text, company_from_pdf, company_needs_repair, PDFIUM_LOCK
 from pdf_layout import layout_text
 from invoice_extract import from_pages
+from invoice_category import classify_invoice
 from pdf_layout import layout_lines
 
 BASE = Path(__file__).resolve().parent
@@ -147,7 +148,7 @@ class Store:
             self.db.execute('ALTER TABLE invoices ADD COLUMN page_count INTEGER DEFAULT 1')
             self.db.commit()
         columns = {row[1] for row in self.db.execute('PRAGMA table_info(invoices)')}
-        for column in ('deleted_at', 'trash_path'):
+        for column in ('deleted_at', 'trash_path', 'purged_at'):
             if column not in columns:
                 self.db.execute(f"ALTER TABLE invoices ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
         self.db.commit()
@@ -224,14 +225,8 @@ class Store:
         finally:
             self.receipts.active.release()
 
-    def category(self, source):
-        if '高铁' in source or '铁路' in source:
-            return '铁路客票'
-        if '车票' in source:
-            return '出行交通'
-        if '工具' in source:
-            return '科研材料'
-        return '其他票据'
+    def category(self, source, text='', title='', filename=''):
+        return classify_invoice(source, text, title, filename)
 
     def metadata(self):
         result = {}
@@ -284,12 +279,13 @@ class Store:
                     page_count = len(pdf.pages)
                     text = '\n'.join(p.extract_text() or '' for p in pdf.pages[:8])[:60000]
                     initial = parse_text(text, path.name)
-                    if initial['amount_cents'] is None or not initial['invoice_no'] or not initial['date']:
-                        try:
-                            reconstructed = from_pages([layout_lines(p) for p in pdf.pages[:8]])
+                    # 基础字段齐全也可能把单位/规格混进品名，仍按列位置核对商品。
+                    try:
+                        reconstructed = from_pages([layout_lines(p) for p in pdf.pages[:8]])
+                        if initial['amount_cents'] is None or not initial['invoice_no'] or not initial['date']:
                             text = '\n'.join(layout_text(p) for p in pdf.pages[:8])[:60000]
-                        except ValueError:
-                            pass
+                    except ValueError:
+                        pass
                 if not text.strip():
                     warning = '无可提取文字，请手动核对'
             except ImportError:
@@ -325,7 +321,7 @@ class Store:
         classification_source = source if source.startswith('手动导入') else str(self.root / source)
         status = '已报销' if '已报销' in Path(classification_source).parts else '待报销'
         values = dict(id=id_, path=str(path), filename=path.name, sha256=digest, mtime_ns=stat.st_mtime_ns, size=stat.st_size,
-                      category=self.category(classification_source), status=status, text=text, warning=warning, page_count=page_count, source=source, created_at=now(), updated_at=now(), **fields)
+                      category=self.category(classification_source, text, fields['title'], path.name), status=status, text=text, warning=warning, page_count=page_count, source=source, created_at=now(), updated_at=now(), **fields)
         self.db.execute(f"INSERT INTO invoices({','.join(values)}) VALUES({','.join('?' for _ in values)})", tuple(values.values()))
         self.event(id_, '导入', source)
         return 'added'
@@ -442,11 +438,11 @@ class Store:
                 row.pop('text')
             last = self.db.execute("SELECT value FROM meta WHERE key='last_scan'").fetchone()
             events = [dict(r) for r in self.db.execute('SELECT e.*,i.title FROM events e LEFT JOIN invoices i ON i.id=e.invoice_id ORDER BY e.id DESC LIMIT 30')]
-            trash = [dict(r) for r in self.db.execute("SELECT id,title,filename,path,invoice_no,status,deleted_at FROM invoices WHERE deleted_at<>'' ORDER BY deleted_at DESC,id")]
+            trash = [dict(r) for r in self.db.execute("SELECT id,title,filename,path,invoice_no,status,deleted_at FROM invoices WHERE deleted_at<>'' AND purged_at='' ORDER BY deleted_at DESC,id")]
             return dict(invoices=rows, categories=list(CATEGORIES), trash=trash, documents=self.documents(), receipt_jobs=self.receipts.recent(), receipt_skill=self.receipts.availability(), root=str(self.root), managed_roots=[str(path) for path in self.managed_roots], root_available=self.root.is_dir(), data_dir=str(self.data_dir), last_scan=last[0] if last else '', events=events, key=self.key)
 
-    def checked_ids(self, ids):
-        if not isinstance(ids, list) or not ids or len(ids) > 2000 or any(not isinstance(id_, str) for id_ in ids):
+    def checked_ids(self, ids, max_count=2000):
+        if not isinstance(ids, list) or not ids or (max_count is not None and len(ids) > max_count) or any(not isinstance(id_, str) for id_ in ids):
             raise ValueError('请选择需要处理的票据')
         return list(dict.fromkeys(ids))
 
@@ -519,7 +515,7 @@ class Store:
         with self.lock:
             plans = []
             for id_ in ids:
-                row = self.db.execute("SELECT * FROM invoices WHERE id=? AND deleted_at<>''", (id_,)).fetchone()
+                row = self.db.execute("SELECT * FROM invoices WHERE id=? AND deleted_at<>'' AND purged_at=''", (id_,)).fetchone()
                 if not row:
                     raise ValueError('回收站记录不存在，请刷新后重试')
                 destination = self.invoice_path(row['path'])
@@ -549,6 +545,90 @@ class Store:
                         destination.rename(source)
                 raise
             return {'restored': len(plans)}
+
+    def empty_trash(self, ids, confirmed=False):
+        if confirmed is not True:
+            raise ValueError('请先确认永久删除回收站票据，此操作无法恢复')
+        ids = [] if ids == [] else self.checked_ids(ids, max_count=None)
+        with self.lock:
+            trash_root = self.data_dir / 'trash'
+            if trash_root.is_symlink() or trash_root.resolve() != trash_root:
+                raise ValueError('回收站目录不能是链接')
+            plans, paths = [], set()
+            # 先检查整个确认快照，避免旧窗口误删已恢复的票据。
+            for id_ in ids:
+                row = self.db.execute('SELECT * FROM invoices WHERE id=?', (id_,)).fetchone()
+                if not row or not row['deleted_at']:
+                    raise ValueError('回收站记录已变化，请刷新后重新确认')
+                if row['purged_at']:
+                    continue
+                source = Path(row['trash_path']) if row['trash_path'] else None
+                if source is not None:
+                    resolved = source.resolve()
+                    if resolved == trash_root or not resolved.is_relative_to(trash_root):
+                        raise ValueError('回收站文件路径不正确')
+                    for part in (source, *source.parents):
+                        if part == trash_root:
+                            break
+                        if part.is_symlink() or getattr(part, 'is_junction', lambda: False)():
+                            raise ValueError('回收站文件不能是链接')
+                    if source.exists() and not source.is_file():
+                        raise ValueError('回收站条目不是文件')
+                    if resolved in paths:
+                        raise ValueError('回收站文件关联冲突，请检查记录')
+                    paths.add(resolved)
+                    source = resolved
+                plans.append((row, source))
+            purged, failed = 0, []
+            for row, source in plans:
+                staged = None
+                try:
+                    if source is not None and source.exists():
+                        staged = source.with_name('.purge-' + secrets.token_hex(16) + source.suffix)
+                        source.rename(staged)
+                    # 保留删除标记，防止扫描或重复导入 ZIP 复活已经清空的记录。
+                    with self.db:
+                        # 保留暂存路径：若进程在提交后中断，仍可定位尚未删除的文件。
+                        self.db.execute("UPDATE invoices SET purged_at=?,trash_path=?,updated_at=? WHERE id=?", (now(), str(staged) if staged else '', now(), row['id']))
+                        self.event(row['id'], '永久删除票据', row['filename'])
+                except Exception as error:
+                    if staged is not None and staged.exists():
+                        try:
+                            if source.exists():
+                                raise FileExistsError('原回收站位置已被占用')
+                            staged.rename(source)
+                        except OSError:
+                            raise ValueError(f'清空失败，文件仍保留在 {staged}，请检查文件权限') from error
+                    failed.append({'id': row['id'], 'error': str(error) or '无法处理此票据'})
+                    continue
+                if staged is not None:
+                    try:
+                        staged.unlink()
+                    except OSError as error:
+                        # 文件占用时退回可恢复状态，只将真正删掉的文件计为成功。
+                        retained = staged
+                        try:
+                            if not source.exists():
+                                staged.rename(source)
+                                retained = source
+                        except OSError:
+                            pass
+                        try:
+                            with self.db:
+                                self.db.execute("UPDATE invoices SET purged_at='',trash_path=?,updated_at=? WHERE id=?", (str(retained), now(), row['id']))
+                                self.event(row['id'], '永久删除失败', str(error))
+                        except Exception as recovery_error:
+                            raise ValueError(f'文件未删除，仍保留在 {retained}，但回收站记录更新失败，请检查数据库') from recovery_error
+                        failed.append({'id': row['id'], 'error': str(error) or '文件被占用，请稍后重试'})
+                        continue
+                purged += 1
+                if source is not None and source.parent != trash_root:
+                    try:
+                        source.parent.rmdir()  # 只清理本条目留下的空目录。
+                    except OSError:
+                        pass
+            remaining = self.db.execute("SELECT COUNT(*) FROM invoices WHERE deleted_at<>'' AND purged_at=''").fetchone()[0]
+            return {'purged': purged, 'failed': failed, 'remaining': remaining}
 
     def export_zip(self, ids):
         ids = self.checked_ids(ids)
@@ -794,6 +874,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(self.store.restore_duplicates(body.get('ids')))
             if self.path == '/api/restore-invoices':
                 return self.send(self.store.restore_invoices(body.get('ids')))
+            if self.path == '/api/empty-trash':
+                return self.send(self.store.empty_trash(body.get('ids'), body.get('confirmed')))
             if self.path == '/api/export-zip':
                 return self.send(self.store.export_zip(body.get('ids')), 'application/zip', filename='发票原件.zip')
             if self.path == '/api/import':

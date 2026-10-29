@@ -61,6 +61,8 @@ input[type=checkbox]{width:17px;height:17px}.muted{color:#64748b}
 .duplicates-table th:last-child{width:112px}
 #trash-dialog{width:min(780px,92vw);max-width:780px;max-height:85vh;overflow:auto}
 .trash-note{font-size:15px;color:#64748b}
+.trash-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:8px 0 14px;flex-wrap:wrap}
+.trash-toolbar .trash-note{margin:0;flex:1;min-width:180px}.trash-toolbar .button{flex-shrink:0}
 .trash-row{display:flex;align-items:flex-start;gap:20px;justify-content:space-between;padding:20px 0;border-top:1px solid var(--border)}
 .trash-row>div{min-width:0;flex:1}.trash-row strong{font-size:15px;font-weight:600}
 .trash-row p{font-size:14px;color:#64748b;margin:5px 0;overflow-wrap:anywhere}

@@ -47,10 +47,17 @@ function updateDuplicateControls(){
   $$('[data-batch]').forEach(button=>{button.disabled=busy||view==='duplicates';});
   $('#delete-duplicates-button').disabled=busy||!selected.size;
   $('#trash-count').textContent=(state.trash||[]).length;
+  updateTrashControls();
+}
+function updateTrashControls(){
+  const empty=$('#empty-trash-button');
+  if(empty)empty.disabled=busy||!(state.trash||[]).length;
+  $$('#trash-list [data-restore-duplicate]').forEach(button=>{button.disabled=busy;});
 }
 function renderTrash(){
   const rows=state.trash||[];
   $('#trash-list').innerHTML=rows.length?rows.map(row=>`<div class="trash-row"><div><strong>${esc(row.title)}</strong><p>${esc(row.filename)}</p><p>删除时间：${esc(new Date(row.deleted_at).toLocaleString('zh-CN'))}</p><p>原位置：${esc(row.path)}</p></div><button class="button" data-restore-duplicate="${row.id}">恢复</button></div>`).join(''):'<p class="empty-state">回收站为空</p>';
+  updateTrashControls();
 }
 async function deleteDuplicates(ids){
   if(busy)return;
@@ -62,9 +69,26 @@ async function deleteDuplicates(ids){
 }
 async function restoreDuplicate(id){
   if(busy)return;
-  busy=true;
+  busy=true;updateDuplicateControls();
   try{const result=await api('/api/restore-invoices',{ids:[id]});await load();renderTrash();toast(`已恢复 ${result.restored} 张票据`);}
-  finally{busy=false;}
+  finally{busy=false;updateDuplicateControls();}
+}
+async function emptyTrash(){
+  if(busy||!(state.trash||[]).length)return;
+  const rows=[...state.trash],ids=rows.map(row=>row.id);
+  busy=true;updateDuplicateControls();
+  try{
+    if(!await confirmInvoiceDeletion(ids.length,true))return;
+    let result,requestError;
+    try{result=await api('/api/empty-trash',{ids,confirmed:true});}
+    catch(error){requestError=error;}
+    try{await load();}catch(error){requestError=requestError||error;}
+    renderTrash();
+    if(requestError)throw requestError;
+    const failed=result.failed||[],names=new Map(rows.map(row=>[row.id,row.title||row.filename||'未命名票据']));
+    const details=failed.slice(0,3).map(item=>`${names.get(item.id)||'票据'}：${item.error||'删除失败'}`).join('\n');
+    toast(`已永久删除 ${result.purged} 张票据，回收站剩余 ${result.remaining} 张${failed.length?`；${failed.length} 张未删除，可重试${details?'\n'+details:''}`:''}`);
+  }finally{busy=false;updateDuplicateControls();}
 }
 async function deleteSelectedInvoices(){
   if(busy||!selected.size)return;
@@ -74,10 +98,13 @@ async function deleteSelectedInvoices(){
   try{const result=await api('/api/delete-invoices',{ids});selected.clear();await load();toast(`已将 ${result.deleted} 张票据移入回收站，可随时恢复`);}
   finally{busy=false;updateDuplicateControls();}
 }
-function confirmInvoiceDeletion(count){
+function confirmInvoiceDeletion(count,permanent=false){
   const dialog=$('#delete-confirm-dialog');
   if(dialog.open)return Promise.resolve(false);
-  $('#delete-confirm-message').textContent=`确定删除选中的 ${count} 张票据吗？`;
+  $('#delete-confirm-title').textContent=permanent?'确认清空回收站':'确认删除票据';
+  $('#delete-confirm-message').textContent=permanent?`确定永久删除当前回收站中的 ${count} 张票据吗？`:`确定删除选中的 ${count} 张票据吗？`;
+  $('#delete-confirm-note').textContent=permanent?'这些票据及其回收站文件将被永久删除，无法恢复。':'票据将移入本地回收站，可以恢复。';
+  $('#delete-confirm-submit').textContent=permanent?'永久删除':'确认删除';
   dialog.returnValue='cancel';
   return new Promise(resolve=>{
     dialog.addEventListener('close',()=>resolve(dialog.returnValue==='confirm'),{once:true});
@@ -103,7 +130,7 @@ function closeDetail(){$('#drawer').classList.add('hidden');$('#drawer-backdrop'
 async function scan(){if(busy)return;busy=true;$('#scan-button').disabled=true;$('#scan-button').innerHTML=icon('refresh')+'正在扫描…';try{const result=await api('/api/scan',{});await load();toast(`扫描完成：新增 ${result.added} 张，更新 ${result.updated} 张${result.errors.length?`，${result.errors.length} 个文件读取失败：\n${result.errors.slice(0,2).join('\n')}`:''}`);}catch(e){report(e);}finally{busy=false;$('#scan-button').disabled=false;$('#scan-button').innerHTML=icon('refresh')+'扫描本地目录';}}
 async function importFiles(files){if(busy){toast('正在处理文件，请稍候');return;}busy=true;$('#import-button').disabled=true;let added=0,unchanged=0,errors=[];try{for(const [index,file] of [...files].entries()){if(file.size>40*1024*1024){errors.push(`${file.name} 超过 40 MB`);continue;}toast(`正在导入 ${index+1} / ${files.length}：${file.name}`);try{const content=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result.split(',')[1]);reader.onerror=()=>reject(Error('文件读取失败'));reader.readAsDataURL(file);});const result=await api('/api/import',{name:file.name,content});added+=result.added;unchanged+=result.unchanged;}catch(e){errors.push(`${file.name}：${e.message}`);}}await load();toast(`导入完成：新增 ${added} 张，已存在 ${unchanged} 张${errors.length?'\n'+errors.slice(0,3).join('\n'):''}`);}finally{busy=false;$('#import-button').disabled=false;$('#file-input').value='';}}
 async function backup(){const response=await fetch('/api/backup',{method:'POST',headers:{'Content-Type':'application/json','X-Workbench-Key':state.key},body:'{}'});if(!response.ok){const data=await response.json();throw Error(data.error);}const url=URL.createObjectURL(await response.blob());const a=document.createElement('a');a.href=url;a.download=`发票台账备份_${new Date().toISOString().slice(0,10)}.sqlite3`;a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);toast('备份已保存到工作台 data/backups，并开始下载');}
-document.addEventListener('click',async e=>{const t=e.target.closest('button,a');try{if(t?.dataset.editCategory){openCategoryEditor(t.dataset.editCategory);return;}if(t?.dataset.deleteDuplicate){await deleteDuplicates([t.dataset.deleteDuplicate]);return;}if(t?.dataset.restoreDuplicate){await restoreDuplicate(t.dataset.restoreDuplicate);return;}if(t?.dataset.original){openDetail(t.dataset.original);return;}if(t?.dataset.view){switchView(t.dataset.view);return;}if(t?.dataset.stat){switchView(t.dataset.stat);return;}if(t?.dataset.batch){if(view==='duplicates'){toast('请打开原票修改报销状态');return;}const ids=[...selected];await api('/api/update',{ids,patch:{status:t.dataset.batch}});selected.clear();await load();toast(`已更新 ${ids.length} 张票据的报销状态`);return;}if(t?.dataset.group){projectFilter=t.dataset.group;view='all';page=1;selected.clear();$('#search').value='';$('#category-filter').value='';$('#status-filter').value='';render();return;}switch(t?.id){case 'delete-selected-button':await deleteSelectedInvoices();return;case 'export-zip-button':await exportSelectedZip();return;case 'delete-duplicates-button':await deleteDuplicates([...selected]);return;case 'trash-button':renderTrash();$('#trash-dialog').showModal();return;case 'close-trash':$('#trash-dialog').close();return;case 'preview-prev':case 'preview-next':{const row=state.invoices.find(r=>r.id===activeId);detailPage+=t.id==='preview-next'?1:-1;$('#pdf-preview').src=`/api/preview/${activeId}?page=${detailPage}`;$('#pdf-preview').alt=`发票原件第 ${detailPage} 页`;$('#zoom-preview').href=`/api/preview/${activeId}?page=${detailPage}`;$('#preview-page').textContent=`${detailPage} / ${row.page_count}`;$('#preview-prev').disabled=detailPage<=1;$('#preview-next').disabled=detailPage>=row.page_count;return;}case 'scan-button':await scan();return;case 'import-button':$('#file-input').click();return;case 'export-button':{const ids=selected.size?[...selected]:filtered().map(r=>r.id);if(!ids.length){toast('没有可导出的票据');return;}location.href='/api/export?ids='+encodeURIComponent(ids.join(','));toast(`正在导出 ${ids.length} 张票据的台账`);return;}case 'prev-page':page--;renderRows();return;case 'next-page':page++;renderRows();return;case 'clear-selection':selected.clear();renderRows();return;case 'close-drawer':closeDetail();return;case 'help-button':$('#help-dialog').showModal();return;case 'close-help':$('#help-dialog').close();return;case 'remove-project-filter':projectFilter=null;renderRows();return;case 'open-folder-button':await api('/api/open-folder',{});return;case 'backup-button':await backup();return;case 'shutdown-button':await api('/api/shutdown',{});toast('本地服务已停止，可双击启动脚本重新打开');return;}const row=e.target.closest('[data-row]');if(row&&!e.target.closest('input'))openDetail(row.dataset.row);}catch(error){report(error);}});
+document.addEventListener('click',async e=>{const t=e.target.closest('button,a');try{if(t?.dataset.editCategory){openCategoryEditor(t.dataset.editCategory);return;}if(t?.dataset.deleteDuplicate){await deleteDuplicates([t.dataset.deleteDuplicate]);return;}if(t?.dataset.restoreDuplicate){await restoreDuplicate(t.dataset.restoreDuplicate);return;}if(t?.dataset.original){openDetail(t.dataset.original);return;}if(t?.dataset.view){switchView(t.dataset.view);return;}if(t?.dataset.stat){switchView(t.dataset.stat);return;}if(t?.dataset.batch){if(view==='duplicates'){toast('请打开原票修改报销状态');return;}const ids=[...selected];await api('/api/update',{ids,patch:{status:t.dataset.batch}});selected.clear();await load();toast(`已更新 ${ids.length} 张票据的报销状态`);return;}if(t?.dataset.group){projectFilter=t.dataset.group;view='all';page=1;selected.clear();$('#search').value='';$('#category-filter').value='';$('#status-filter').value='';render();return;}switch(t?.id){case 'delete-selected-button':await deleteSelectedInvoices();return;case 'export-zip-button':await exportSelectedZip();return;case 'delete-duplicates-button':await deleteDuplicates([...selected]);return;case 'trash-button':renderTrash();$('#trash-dialog').showModal();return;case 'close-trash':$('#trash-dialog').close();return;case 'empty-trash-button':await emptyTrash();return;case 'preview-prev':case 'preview-next':{const row=state.invoices.find(r=>r.id===activeId);detailPage+=t.id==='preview-next'?1:-1;$('#pdf-preview').src=`/api/preview/${activeId}?page=${detailPage}`;$('#pdf-preview').alt=`发票原件第 ${detailPage} 页`;$('#zoom-preview').href=`/api/preview/${activeId}?page=${detailPage}`;$('#preview-page').textContent=`${detailPage} / ${row.page_count}`;$('#preview-prev').disabled=detailPage<=1;$('#preview-next').disabled=detailPage>=row.page_count;return;}case 'scan-button':await scan();return;case 'import-button':$('#file-input').click();return;case 'export-button':{const ids=selected.size?[...selected]:filtered().map(r=>r.id);if(!ids.length){toast('没有可导出的票据');return;}location.href='/api/export?ids='+encodeURIComponent(ids.join(','));toast(`正在导出 ${ids.length} 张票据的台账`);return;}case 'prev-page':page--;renderRows();return;case 'next-page':page++;renderRows();return;case 'clear-selection':selected.clear();renderRows();return;case 'close-drawer':closeDetail();return;case 'help-button':$('#help-dialog').showModal();return;case 'close-help':$('#help-dialog').close();return;case 'remove-project-filter':projectFilter=null;renderRows();return;case 'open-folder-button':await api('/api/open-folder',{});return;case 'backup-button':await backup();return;case 'shutdown-button':await api('/api/shutdown',{});toast('本地服务已停止，可双击启动脚本重新打开');return;}const row=e.target.closest('[data-row]');if(row&&!e.target.closest('input'))openDetail(row.dataset.row);}catch(error){report(error);}});
 document.addEventListener('change',e=>{if(e.target.dataset.select){e.target.checked?selected.add(e.target.dataset.select):selected.delete(e.target.dataset.select);renderRows();}if(e.target.id==='select-all'){filtered().forEach(r=>e.target.checked?selected.add(r.id):selected.delete(r.id));renderRows();}if(['category-filter','status-filter','sort-filter'].includes(e.target.id)){page=1;selected.clear();renderRows();}if(e.target.id==='file-input')importFiles(e.target.files).catch(report);});
 $('#search').addEventListener('input',()=>{page=1;selected.clear();renderRows();});
 $('#drawer-backdrop').addEventListener('click',closeDetail);

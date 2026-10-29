@@ -37,3 +37,4 @@ jobs:
           node test_ui_filters.cjs
           node test_themes.cjs
           node test_receipt_polling.cjs
+          node test_empty_trash.cjs
