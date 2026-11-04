@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>发票批量打印</title>
+  <link rel="stylesheet" href="/print.css">
+  <script src="/print.js" defer></script>
+</head>
+<body>
+  <header class="toolbar">
+    <div><h1>批量打印</h1><p id="print-status" role="status" aria-live="polite">正在核对所选发票…</p></div>
+    <div class="actions"><button id="print-button" disabled>打印</button><button id="close-print" class="secondary">关闭</button></div>
+  </header>
+  <main id="pages" aria-label="发票打印预览"></main>
+</body>
+</html>

@@ -38,3 +38,5 @@ jobs:
           node test_themes.cjs
           node test_receipt_polling.cjs
           node test_empty_trash.cjs
+          node test_export_zip.cjs
+          node test_invoice_print.cjs

@@ -30,6 +30,7 @@ from pdf_layout import layout_text
 from invoice_extract import from_pages
 from invoice_category import classify_invoice
 from pdf_layout import layout_lines
+from invoice_print import page_count as print_page_count, render_page as render_print_page
 
 BASE = Path(__file__).resolve().parent
 EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg'}
@@ -630,37 +631,88 @@ class Store:
             remaining = self.db.execute("SELECT COUNT(*) FROM invoices WHERE deleted_at<>'' AND purged_at=''").fetchone()[0]
             return {'purged': purged, 'failed': failed, 'remaining': remaining}
 
-    def export_zip(self, ids):
+    def selected_files(self, ids):
+        """在持有 Store 锁时获取本次导出/打印的原票快照。"""
         ids = self.checked_ids(ids)
+        active = {row['id']: row for row in self.state()['invoices']}
+        rows = []
+        total_size = 0
+        for id_ in ids:
+            row = active.get(id_)
+            if not row or row['missing']:
+                raise ValueError('所选票据文件不存在或已被忽略，请刷新后重试')
+            path = self.invoice_path(row['path'])
+            size = path.stat().st_size
+            if not path.is_file() or size > MAX_FILE:
+                raise ValueError('所选票据不可读取或超过单文件 40 MB 上限')
+            total_size += size
+            if total_size > MAX_ZIP:
+                raise ValueError('单次原文件总大小不能超过 200 MB，请分批处理')
+            rows.append((row, path))
+        return rows
+
+    @staticmethod
+    def read_selected_file(row, path):
+        content = path.read_bytes()
+        if len(content) > MAX_FILE:
+            raise ValueError('所选文件大小发生变化，请重新扫描后重试')
+        if hashlib.sha256(content).hexdigest() != row['sha256']:
+            raise ValueError('所选票据文件已变化，请重新扫描后重试')
+        return content
+
+    def print_manifest(self, ids):
         with self.lock:
-            active = {row['id']: row for row in self.state()['invoices']}
-            rows = []
-            total_size = 0
-            for id_ in ids:
-                row = active.get(id_)
-                if not row or row['missing']:
-                    raise ValueError('所选票据文件不存在或已被忽略，请刷新后重试')
-                path = self.invoice_path(row['path'])
-                size = path.stat().st_size
-                if not path.is_file() or size > MAX_FILE:
-                    raise ValueError('所选票据不可读取或超过单文件 40 MB 上限')
-                total_size += size
-                if total_size > MAX_ZIP:
-                    raise ValueError('单次 ZIP 导出的原文件总大小不能超过 200 MB，请分批导出')
-                rows.append((row, path))
+            rows = self.selected_files(ids)
+            pages = []
+            for row, path in rows:
+                try:
+                    count = print_page_count(self.read_selected_file(row, path), path.suffix)
+                except Exception as error:
+                    raise ValueError(f'{row["filename"]}：无法准备打印，{error}') from error
+                pages.extend(dict(id=row['id'], page=page, sha256=row['sha256'], filename=row['filename'])
+                             for page in range(1, count + 1))
+            return dict(invoice_count=len(rows), pages=pages)
+
+    def print_page(self, id_, sha256, page):
+        with self.lock:
+            row, path = self.selected_files([id_])[0]
+            if row['sha256'] != sha256:
+                raise ValueError('票据记录已变化，请重新准备打印')
+            content = self.read_selected_file(row, path)
+        try:
+            return render_print_page(content, path.suffix, page)
+        except Exception as error:
+            raise ValueError(f'{row["filename"]}：无法读取打印页面，{error}') from error
+
+    def export_zip(self, ids, *, with_filename=False):
+        with self.lock:
+            rows = self.selected_files(ids)
             output = io.BytesIO()
             actual_size = 0
             with zipfile.ZipFile(output, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
                 for index, (row, path) in enumerate(rows, 1):
-                    content = path.read_bytes()
+                    content = self.read_selected_file(row, path)
                     actual_size += len(content)
                     if len(content) > MAX_FILE or actual_size > MAX_ZIP:
                         raise ValueError('所选文件大小发生变化，请重新扫描后导出')
-                    if hashlib.sha256(content).hexdigest() != row['sha256']:
-                        raise ValueError('所选票据文件已变化，请重新扫描后导出')
                     # 序号避免同名覆盖；ZIP 不包含本机绝对路径。
                     archive.writestr(f'{index:04d}_{safe_name(row["filename"])}', content)
-            return output.getvalue()
+            # 与实际打包的票据使用同一份快照；重复副本不重复累计金额。
+            unique = {}
+            for row, _ in rows:
+                key = row['duplicate_of'] or row['id']
+                if key not in unique or not row['duplicate_of']:
+                    unique[key] = row
+            missing = sum(row['amount_cents'] is None for row in unique.values())
+            total = sum(row['amount_cents'] or 0 for row in unique.values())
+            if missing == len(unique):
+                amount = '总金额待填写'
+            elif missing:
+                amount = f'已知金额{Decimal(total) / 100:.2f}元_{missing}张金额待填写'
+            else:
+                amount = f'总金额{Decimal(total) / 100:.2f}元'
+            filename = f'发票_{len(rows)}张_{amount}_{datetime.now():%Y-%m-%d}.zip'
+            return (output.getvalue(), filename) if with_filename else output.getvalue()
 
     def update(self, ids, patch):
         allowed = {'title', 'invoice_no', 'date', 'amount', 'category', 'seller', 'status', 'project', 'notes', 'reviewed'}
@@ -753,7 +805,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'no-referrer')
         self.send_header('X-Frame-Options', 'SAMEORIGIN')
-        self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; object-src 'self'; connect-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'")
+        self.send_header('Content-Security-Policy', "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-src 'self'; object-src 'self'; connect-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'")
         if filename:
             self.send_header('Content-Disposition', "attachment; filename*=UTF-8''" + quote(filename))
         self.end_headers()
@@ -775,6 +827,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(self.store.state())
             if route.startswith('/api/category-history/'):
                 return self.send(self.store.category_history(route.rsplit('/', 1)[-1]))
+            if route.startswith('/api/print-page/'):
+                return self.send(self.store.print_page(route.rsplit('/', 1)[-1], query.get('sha', [''])[0],
+                                                      int(query.get('page', ['1'])[0])), 'image/png')
             if route.startswith('/api/receipt-jobs/'):
                 if route.endswith('/statistics'):
                     return self.send(self.store.receipts.statistics_data(route.split('/')[-2]))
@@ -832,7 +887,7 @@ class Handler(BaseHTTPRequestHandler):
                     fields = [row['title'], row['invoice_no'], row['date'], '' if row['amount_cents'] is None else f"{row['amount_cents']/100:.2f}", row['category'], row['status'], row['project'], row['seller'], row['notes'], row['path'], '是' if row['duplicate_of'] else '否']
                     writer.writerow([cell(v) for v in fields])
                 return self.send(b'\xef\xbb\xbf' + out.getvalue().encode(), 'text/csv; charset=utf-8', filename='发票台账.csv')
-            assets = {'/': 'index.html', '/app.js': 'app.js', '/receipts.js': 'receipts.js', '/statistics.js': 'statistics.js', '/folders.js': 'folders.js', '/categories.js': 'categories.js', '/themes.js': 'themes.js', '/themes.css': 'themes.css', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg'}
+            assets = {'/': 'index.html', '/print.html': 'print.html', '/print.js': 'print.js', '/print.css': 'print.css', '/app.js': 'app.js', '/receipts.js': 'receipts.js', '/statistics.js': 'statistics.js', '/folders.js': 'folders.js', '/categories.js': 'categories.js', '/themes.js': 'themes.js', '/themes.css': 'themes.css', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg'}
             if route in assets:
                 path = BASE / 'web' / assets[route]
                 return self.send(path.read_bytes(), mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
@@ -877,7 +932,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/api/empty-trash':
                 return self.send(self.store.empty_trash(body.get('ids'), body.get('confirmed')))
             if self.path == '/api/export-zip':
-                return self.send(self.store.export_zip(body.get('ids')), 'application/zip', filename='发票原件.zip')
+                content, filename = self.store.export_zip(body.get('ids'), with_filename=True)
+                return self.send(content, 'application/zip', filename=filename)
+            if self.path == '/api/print-invoices':
+                return self.send(self.store.print_manifest(body.get('ids')))
             if self.path == '/api/import':
                 return self.send(self.store.upload(body['name'], body['content']))
             if self.path == '/api/backup':

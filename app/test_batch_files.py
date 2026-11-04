@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 import urllib.error
 import urllib.request
+from urllib.parse import unquote
 from zipfile import ZipFile
 
 from server import Store, LocalServer, Handler
@@ -103,6 +104,33 @@ class BatchFileTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.store.restore_invoices([self.ids[1]])
         self.assertEqual(self.second.read_bytes(),b'new file')
 
+    def test_zip_filename_uses_selected_total_and_marks_missing_amounts(self):
+        self.store.update([self.ids[0]], {'amount': '0.10'})
+        self.store.update([self.ids[1]], {'amount': '0.20'})
+        _, name = self.store.export_zip([*self.ids, self.ids[0]], with_filename=True)
+        self.assertRegex(name, r'^发票_2张_总金额0\.30元_\d{4}-\d{2}-\d{2}\.zip$')
+        other = self.rows[self.other]['id']
+        _, name = self.store.export_zip([self.ids[0], other], with_filename=True)
+        self.assertIn('已知金额0.10元_1张金额待填写', name)
+        _, name = self.store.export_zip([other], with_filename=True)
+        self.assertIn('总金额待填写', name)
+        self.store.update([other], {'amount': '0'})
+        _, name = self.store.export_zip([other], with_filename=True)
+        self.assertIn('总金额0.00元', name)
+
+    def test_zip_filename_counts_same_invoice_once_but_exports_each_selected_file(self):
+        self.store.update([self.ids[0]], {'amount': '12.34'})
+        duplicate = self.root / '重复.png'
+        duplicate.write_bytes(self.first.read_bytes())
+        self.store.scan()
+        duplicate_id = next(row['id'] for row in self.store.state()['invoices'] if row['path'] == str(duplicate))
+        self.store.update([duplicate_id], {'amount': '12.34'})
+        for ids in ([duplicate_id, self.ids[0]], [self.ids[0], duplicate_id], [duplicate_id]):
+            content, name = self.store.export_zip(ids, with_filename=True)
+            self.assertIn('总金额12.34元', name)
+            with ZipFile(io.BytesIO(content)) as archive:
+                self.assertEqual(len(archive.namelist()), len(ids))
+
     def test_ignored_directory_excludes_existing_rows_zip_documents_and_metadata(self):
         ignored=self.root/'工具/入库单数据'
         ignored.mkdir(parents=True)
@@ -132,6 +160,8 @@ class BatchFileTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT deleted_at FROM invoices WHERE id=?',(preview_row['id'],)).fetchone()[0],'')
 
     def test_http_zip_delete_restore_are_authenticated(self):
+        self.store.update([self.ids[0]], {'amount': '12.34'})
+        self.store.update([self.ids[1]], {'amount': '56.78'})
         server=LocalServer(('127.0.0.1',0),Handler)
         server.store=self.store
         thread=threading.Thread(target=server.serve_forever,daemon=True)
@@ -146,6 +176,7 @@ class BatchFileTests(unittest.TestCase):
                 self.assertEqual(error.exception.code,403)
             with post('/api/export-zip') as response:
                 self.assertEqual(response.headers['Content-Type'],'application/zip')
+                self.assertIn('发票_2张_总金额69.12元_', unquote(response.headers['Content-Disposition']))
                 with ZipFile(io.BytesIO(response.read())) as archive:self.assertEqual(len(archive.namelist()),2)
             with post('/api/delete-invoices') as response:self.assertEqual(json.load(response)['deleted'],2)
             with post('/api/restore-invoices') as response:self.assertEqual(json.load(response)['restored'],2)
