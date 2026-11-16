@@ -440,7 +440,41 @@ class Store:
             last = self.db.execute("SELECT value FROM meta WHERE key='last_scan'").fetchone()
             events = [dict(r) for r in self.db.execute('SELECT e.*,i.title FROM events e LEFT JOIN invoices i ON i.id=e.invoice_id ORDER BY e.id DESC LIMIT 30')]
             trash = [dict(r) for r in self.db.execute("SELECT id,title,filename,path,invoice_no,status,deleted_at FROM invoices WHERE deleted_at<>'' AND purged_at='' ORDER BY deleted_at DESC,id")]
-            return dict(invoices=rows, categories=list(CATEGORIES), trash=trash, documents=self.documents(), receipt_jobs=self.receipts.recent(), receipt_skill=self.receipts.availability(), root=str(self.root), managed_roots=[str(path) for path in self.managed_roots], root_available=self.root.is_dir(), data_dir=str(self.data_dir), last_scan=last[0] if last else '', events=events, key=self.key)
+            undo = self._batch_undo()
+            batch_undo = None
+            if undo:
+                statuses = {row['id']: row['status'] for row in rows}
+                if all(statuses.get(id_) == undo['status'] for id_ in undo['rows']):
+                    batch_undo = dict(token=undo['token'], count=len(undo['rows']))
+            return dict(invoices=rows, categories=list(CATEGORIES), trash=trash, documents=self.documents(), receipt_jobs=self.receipts.recent(), receipt_skill=self.receipts.availability(), root=str(self.root), managed_roots=[str(path) for path in self.managed_roots], root_available=self.root.is_dir(), data_dir=str(self.data_dir), last_scan=last[0] if last else '', events=events, key=self.key, batch_undo=batch_undo)
+
+    def _batch_undo(self):
+        row = self.db.execute("SELECT value FROM meta WHERE key='batch_undo'").fetchone()
+        return json.loads(row['value']) if row else None
+
+    def _remember_batch(self, rows, status):
+        undo = dict(rows=rows, token=secrets.token_hex(16), status=status)
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES('batch_undo',?)", (json.dumps(undo, ensure_ascii=False),))
+
+    def _forget_batch(self):
+        self.db.execute("DELETE FROM meta WHERE key='batch_undo'")
+
+    def undo_batch(self, token):
+        with self.lock:
+            undo = self._batch_undo()
+            if not undo or undo['token'] != token:
+                raise ValueError('上一步操作已变化，请刷新后核对')
+            rows = undo['rows']
+            for id_ in rows:
+                current = self.db.execute("SELECT status FROM invoices WHERE id=? AND deleted_at=''", (id_,)).fetchone()
+                if not current or current['status'] != undo['status']:
+                    raise ValueError('有票据状态已变化，无法撤销这一批标记')
+            with self.db:
+                for id_, previous in rows.items():
+                    self.db.execute('UPDATE invoices SET status=?,updated_at=? WHERE id=?', (previous, now(), id_))
+                    self.event(id_, '撤销批量标记', json.dumps({'before': undo['status'], 'after': previous}, ensure_ascii=False))
+                self._forget_batch()
+            return {'undone': len(rows)}
 
     def checked_ids(self, ids, max_count=2000):
         if not isinstance(ids, list) or not ids or (max_count is not None and len(ids) > max_count) or any(not isinstance(id_, str) for id_ in ids):
@@ -714,11 +748,13 @@ class Store:
             filename = f'发票_{len(rows)}张_{amount}_{datetime.now():%Y-%m-%d}.zip'
             return (output.getvalue(), filename) if with_filename else output.getvalue()
 
-    def update(self, ids, patch):
+    def update(self, ids, patch, *, remember_batch=False):
         allowed = {'title', 'invoice_no', 'date', 'amount', 'category', 'seller', 'status', 'project', 'notes', 'reviewed'}
         ids = self.checked_ids(ids)
         if not isinstance(patch, dict) or set(patch) - allowed:
             raise ValueError('无效的修改参数')
+        if remember_batch and set(patch) != {'status'}:
+            raise ValueError('批量标记只支持修改报销状态')
         values = {}
         for field, value in patch.items():
             if field == 'amount':
@@ -736,24 +772,38 @@ class Store:
             raise ValueError('不支持的报销状态')
         if values.get('date'):
             datetime.strptime(values['date'], '%Y-%m-%d')
-        values['manual'] = 1
+        if not remember_batch:
+            values['manual'] = 1
         values['updated_at'] = now()
         with self.lock:
             before = {}
             for id_ in ids:
-                row = self.db.execute("SELECT category FROM invoices WHERE id=? AND deleted_at=''", (id_,)).fetchone()
+                row = self.db.execute("SELECT category,status FROM invoices WHERE id=? AND deleted_at=''", (id_,)).fetchone()
                 if not row:
                     raise ValueError('票据不存在')
-                before[id_] = row['category'] or ''
+                before[id_] = row
+            changed_status = {id_: row['status'] for id_, row in before.items()
+                              if 'status' in values and row['status'] != values['status']}
+            if remember_batch:
+                ids = list(changed_status)
             # 类型变更及其审计记录必须一起提交，失败时一起回滚。
             with self.db:
                 for id_ in ids:
                     self.db.execute('UPDATE invoices SET ' + ','.join(f'{k}=?' for k in values) + ' WHERE id=?', (*values.values(), id_))
-                    changed_type = 'category' in values and before[id_] != values['category']
+                    old_category = before[id_]['category'] or ''
+                    changed_type = 'category' in values and old_category != values['category']
                     if changed_type:
-                        self.event(id_, '修改发票类型', json.dumps({'before': before[id_], 'after': values['category']}, ensure_ascii=False))
+                        self.event(id_, '修改发票类型', json.dumps({'before': old_category, 'after': values['category']}, ensure_ascii=False))
                     if set(patch) != {'category'}:
                         self.event(id_, '修改', json.dumps(patch, ensure_ascii=False))
+                if remember_batch and changed_status:
+                    self._remember_batch(changed_status, values['status'])
+                elif changed_status:
+                    undo = self._batch_undo()
+                    if undo and changed_status.keys() & undo['rows'].keys():
+                        self._forget_batch()
+            if remember_batch:
+                return len(ids)
 
     def category_history(self, id_):
         with self.lock:
@@ -871,7 +921,7 @@ class Handler(BaseHTTPRequestHandler):
                 doc = next((d for d in downloads if d['id'] == id_), None)
                 if not doc:
                     return self.send({'error': '文档不存在'}, status=404)
-                return self.send(Path(doc['path']).read_bytes(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', filename=doc['name'])
+                return self.send(Path(doc['path']).read_bytes(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', filename=doc['download_name'])
             if route == '/api/export':
                 rows = self.store.state()['invoices']
                 ids = set(query.get('ids', [''])[0].split(',')) if query.get('ids') else None
@@ -919,8 +969,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path.startswith('/api/receipt-jobs/') and self.path.endswith('/manual'):
                 return self.send(self.store.receipts.save_manual(self.path.split('/')[-2], body.get('invoices'), resume=body.get('resume') is True))
             if self.path == '/api/update':
-                self.store.update(body.get('ids'), body.get('patch'))
-                return self.send({'ok': True})
+                remember_batch = body.get('remember_batch') is True
+                changed = self.store.update(body.get('ids'), body.get('patch'), remember_batch=remember_batch)
+                return self.send({'ok': True, 'updated': changed} if remember_batch else {'ok': True})
+            if self.path == '/api/undo-batch':
+                return self.send(self.store.undo_batch(body.get('token')))
             if self.path == '/api/delete-duplicates':
                 return self.send(self.store.delete_duplicates(body.get('ids')))
             if self.path == '/api/delete-invoices':

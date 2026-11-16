@@ -33,6 +33,44 @@ class BatchFileTests(unittest.TestCase):
         self.store.db.close()
         self.temp.cleanup()
 
+    def test_undo_batch_restores_mixed_statuses_after_reopen(self):
+        self.store.update([self.ids[1]], {'status': '报销中'})
+        other_id = self.rows[self.other]['id']
+        self.store.update([other_id], {'status': '已报销'})
+        ids = [*self.ids, other_id]
+        self.assertEqual(self.store.update(ids, {'status': '已报销'}, remember_batch=True), 2)
+        undo = self.store.state()['batch_undo']
+        self.assertEqual(undo['count'], 2)
+        self.assertEqual(self.store.update(ids, {'status': '已报销'}, remember_batch=True), 0)
+        self.store.update([self.ids[0]], {'notes': '标记后的备注'})
+        self.store.db.close()
+        self.store = Store(self.root, self.root/'app/data')
+        self.assertEqual(self.store.state()['batch_undo'], undo)
+        self.assertEqual(self.store.undo_batch(undo['token']), {'undone': 2})
+        rows = {row['id']: row for row in self.store.state()['invoices']}
+        self.assertEqual([rows[id_]['status'] for id_ in ids], ['待报销', '报销中', '已报销'])
+        self.assertEqual(rows[self.ids[0]]['notes'], '标记后的备注')
+        self.assertIsNone(self.store.state()['batch_undo'])
+
+    def test_undo_rejects_stale_operations_and_never_restores_deletion(self):
+        self.store.update(self.ids, {'status': '已报销'}, remember_batch=True)
+        stale_token = self.store.state()['batch_undo']['token']
+        self.store.update(self.ids, {'status': '待报销'}, remember_batch=True)
+        with self.assertRaisesRegex(ValueError, '已变化'):
+            self.store.undo_batch(stale_token)
+        undo = self.store.state()['batch_undo']
+        with patch.object(self.store, 'event', side_effect=RuntimeError('audit failure')):
+            with self.assertRaises(RuntimeError):
+                self.store.undo_batch(undo['token'])
+        self.assertEqual(self.store.state()['batch_undo'], undo)
+        self.store.update([self.ids[0]], {'status': '已报销'})
+        self.assertIsNone(self.store.state()['batch_undo'])
+        self.store.delete_invoices(self.ids)
+        self.assertIsNone(self.store.state()['batch_undo'])
+        with self.assertRaises(ValueError):
+            self.store.undo_batch(undo['token'])
+        self.assertFalse(self.first.exists() or self.second.exists())
+
     def test_delete_originals_rescan_restart_and_restore_preserves_fields(self):
         self.store.update(self.ids,{'notes':'批量备注','status':'已报销'})
         self.assertEqual(self.store.delete_invoices(self.ids)['deleted'],2)
@@ -168,12 +206,18 @@ class BatchFileTests(unittest.TestCase):
         thread.start()
         opener=urllib.request.build_opener(urllib.request.ProxyHandler({}))
         base=f'http://127.0.0.1:{server.server_port}'
-        def post(path,key=True):
-            return opener.open(urllib.request.Request(base+path,data=json.dumps({'ids':self.ids}).encode(),headers={'X-Workbench-Key':self.store.key if key else ''}))
+        def post(path,key=True,body=None):
+            return opener.open(urllib.request.Request(base+path,data=json.dumps({'ids':self.ids} if body is None else body).encode(),headers={'X-Workbench-Key':self.store.key if key else ''}))
         try:
-            for route in ['/api/export-zip','/api/delete-invoices','/api/restore-invoices']:
+            for route in ['/api/export-zip','/api/delete-invoices','/api/restore-invoices','/api/undo-batch']:
                 with self.assertRaises(urllib.error.HTTPError) as error:post(route,key=False)
                 self.assertEqual(error.exception.code,403)
+            with post('/api/update',body={'ids':self.ids,'patch':{'status':'已报销'},'remember_batch':True}) as response:
+                self.assertEqual(json.load(response)['updated'],2)
+            with opener.open(base+'/api/state') as response:
+                token=json.load(response)['batch_undo']['token']
+            with post('/api/undo-batch',body={'token':token}) as response:
+                self.assertEqual(json.load(response)['undone'],2)
             with post('/api/export-zip') as response:
                 self.assertEqual(response.headers['Content-Type'],'application/zip')
                 self.assertIn('发票_2张_总金额69.12元_', unquote(response.headers['Content-Disposition']))

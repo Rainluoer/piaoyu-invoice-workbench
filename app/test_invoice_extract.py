@@ -46,6 +46,39 @@ def layered_invoice(path, conflict=False, discount=False, invoice_no='1234567890
 
 
 class LayoutExtractionTests(unittest.TestCase):
+    def test_same_name_different_specs_each_receive_their_own_discount(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / '001.pdf'
+            pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+            page = canvas.Canvas(str(path), pagesize=(600, 400))
+            page.setFont('STSong-Light', 8)
+            for x, y, text in ((350, 370, '发票号码：12345678901234567890'),
+                               (20, 240, '项目名称'), (150, 240, '规格型号'), (230, 240, '单位'),
+                               (280, 240, '数量'), (310, 240, '单价'), (410, 240, '金额'),
+                               (480, 240, '税率'), (530, 240, '税额'),
+                               (20, 120, '价税合计（大写）'), (410, 120, '（小写）¥33.67')):
+                page.drawString(x, y, text)
+            for y, spec, quantity, amount, tax, discount in (
+                    (220, 'Matte White', '1', '10.00', '1.30', '-0.10'),
+                    (188, 'Matte Black', '2', '20.00', '2.60', '-0.10')):
+                for x, text in ((20, '*材料*线材'), (150, spec), (230, '卷'), (280, quantity),
+                                (310, '10.00'), (410, amount), (480, '13%'), (530, tax)):
+                    page.drawString(x, y, text)
+                for x, text in ((20, '*材料*线材'), (410, discount), (480, '13%'),
+                                (530, '-0.01' if quantity == '1' else '-0.02')):
+                    page.drawString(x, y - 14, text)
+            page.save()
+            result = extract_layout_invoice(path)
+            self.assertEqual([(item['spec'], item['amount']) for item in result['items']],
+                             [('Matte White', 10), ('Matte Black', 20)])
+            self.assertEqual([discount['item_index'] for discount in result['discounts']], [0, 1])
+            self.assertEqual([row['price'] for row in rows_from_invoices([result])], ['11.19', '22.48'])
+            ambiguous = copy.deepcopy(result)
+            ambiguous['discounts'].pop(0)
+            ambiguous['total'] = 33.78  # 总额能对上也不能擅自归属同名商品的单笔折扣。
+            with self.assertRaisesRegex(ValueError, '折扣归属'):
+                check_invoice(ambiguous)
+
     def test_explicit_discount_is_kept_and_checked_against_same_product(self):
         with TemporaryDirectory() as directory:
             path=Path(directory)/'001.pdf';layered_invoice(path,discount=True)

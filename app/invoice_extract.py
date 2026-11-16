@@ -26,13 +26,51 @@ def _decimal(value):
         raise ValueError('商品数字字段无效') from None
 
 
+def discounted_items(info):
+    """将已定位的折扣应用到各商品，保留原始商品与折扣记录。"""
+    items = info['items']
+    discounts = info.get('discounts', [])
+    if not isinstance(discounts, list):
+        raise ValueError('折扣行格式无效')
+    if not discounts:
+        return items
+    adjusted = [dict(item) for item in items]
+    assigned = set()
+    ambiguous_groups = []
+    for discount in discounts:
+        if not isinstance(discount, dict):
+            raise ValueError('折扣行格式无效')
+        index = discount.get('item_index', 0 if len(items) == 1 else None)
+        def matches(item):
+            return (all(discount.get(key) == item.get(key) for key in ('product', 'category', 'tax_rate'))
+                    and (not discount.get('spec') or discount['spec'] == item.get('spec')))
+        if (type(index) is not int or not 0 <= index < len(items) or not matches(items[index])
+                or (len(items) > 1 and index in assigned)):
+            raise ValueError('折扣归属不明确，请核对商品')
+        amount, tax = _decimal(discount.get('amount')), _decimal(discount.get('tax'))
+        if amount >= 0 or tax > 0:
+            raise ValueError('折扣金额或税额无效')
+        for key, change in (('amount', amount), ('tax', tax)):
+            net = _decimal(adjusted[index][key]) + change
+            if net < 0:
+                raise ValueError('折扣超过对应商品金额或税额')
+            adjusted[index][key] = float(net)
+        assigned.add(index)
+        candidates = {i for i, item in enumerate(items) if matches(item)}
+        if len(candidates) > 1:
+            ambiguous_groups.append(candidates)
+    # 同名同税率且折扣未注明规格时，只有整组均有逐项折扣才接受票面行序。
+    if any(not group <= assigned for group in ambiguous_groups):
+        raise ValueError('折扣归属不明确，请核对商品')
+    return adjusted
+
+
 def check_invoice(info, strict_total=True):
     if not isinstance(info, dict) or not info.get('invoice_no') or info.get('total') is None or not isinstance(info.get('items'), list) or not info['items']:
         raise ValueError('票号、商品或价税合计未完整识别')
     total = _decimal(info['total'])
     if total < 0:
         raise ValueError('暂不自动生成负数发票')
-    amounts = Decimal(0)
     for item in info['items']:
         if not isinstance(item, dict) or not isinstance(item.get('product'), str) or not item['product'].strip():
             raise ValueError('商品名称未识别')
@@ -41,25 +79,10 @@ def check_invoice(info, strict_total=True):
             raise ValueError('商品数量或金额异常')
         if abs(quantity * price - amount) > Decimal('.015'):
             raise ValueError('数量乘单价与不含税金额不符，请核对数字列')
-        amounts += amount + tax
-    discounts = info.get('discounts', [])
-    if not isinstance(discounts, list):
-        raise ValueError('折扣行格式无效')
-    for discount in discounts:
-        # 只自动归属完整品名、类目相同的单商品折扣，其他情况继续补填。
-        if (len(info['items']) != 1 or not isinstance(discount, dict)
-                or discount.get('product') != info['items'][0]['product']
-                or discount.get('category') != info['items'][0].get('category')
-                or discount.get('tax_rate') != info['items'][0].get('tax_rate')):
-            raise ValueError('折扣归属不明确，请核对商品')
-        amount, tax = _decimal(discount.get('amount')), _decimal(discount.get('tax'))
-        if amount >= 0 or tax > 0:
-            raise ValueError('折扣金额或税额无效')
-        amounts += amount + tax
-    if amounts < 0:
-        raise ValueError('折扣超过商品金额')
+    amounts = sum(_decimal(item['amount']) + _decimal(item['tax']) for item in discounted_items(info))
     # 未归属的折扣或漏项交给补填；不凭整单金额推算并伪造商品数字。
-    if (strict_total or len(info['items']) > 1) and abs(amounts - total) > Decimal('.01'):
+    tolerance = 0 if info.get('discounts') else Decimal('.01')
+    if (strict_total or len(info['items']) > 1) and abs(amounts - total) > tolerance:
         raise ValueError('商品含税金额与价税合计不符，可能有漏项或折扣行')
     return info
 
@@ -73,8 +96,10 @@ def _column_start(row, label):
     return chars[index]['x0'] - 3
 
 
-def _cell(row, left, right):
-    return ''.join(c['text'] for c in row['chars'] if left <= (c['x0'] + c['x1']) / 2 < right).strip()
+def _cell(row, left, right, spaced=False):
+    chars = [c for c in row['chars'] if left <= (c['x0'] + c['x1']) / 2 < right]
+    return ''.join((' ' if spaced and i and c['x0'] - chars[i - 1]['x1'] > 1 else '') + c['text']
+                   for i, c in enumerate(chars)).strip()
 
 
 def from_pages(pages):
@@ -92,6 +117,7 @@ def from_pages(pages):
             compact = re.sub(r'\s+', '', row['text'])
             if all(label in compact for label in ('项目名称', '规格型号', '单位', '数量', '单价', '金额', '税额')):
                 header = row
+                current = None
                 continue
             if header is None:
                 continue
@@ -115,11 +141,15 @@ def from_pages(pages):
                     if _cell(row, unit_left, amount_left):
                         raise ValueError('折扣行的数量或单价列非空')
                     amount, rate, tax = discount.groups()
-                    current = dict(category=category[1], product=category[2], amount=float(amount), tax_rate=rate, tax=float(tax), spec=_cell(row,spec_left,unit_left))
+                    item_index = len(result['items']) - 1 if result['items'] and current is result['items'][-1] else None
+                    if item_index is None and current and 'item_index' in current:
+                        item_index = current['item_index']  # 连续单商品折扣仍按上一商品核对。
+                    current = dict(category=category[1], product=category[2], amount=float(amount), tax_rate=rate, tax=float(tax),
+                                   spec=_cell(row, spec_left, unit_left, spaced=True), item_index=item_index)
                     result.setdefault('discounts', []).append(current)
                 else:
                     unit, quantity, price, amount, rate, tax = match.groups()
-                    current = dict(category=category[1], product=category[2], spec=_cell(row,spec_left,unit_left),
+                    current = dict(category=category[1], product=category[2], spec=_cell(row, spec_left, unit_left, spaced=True),
                         unit=unit, quantity=float(quantity), unit_price=float(price), amount=float(amount), tax_rate=rate, tax=float(tax))
                     if current['quantity'].is_integer():
                         current['quantity'] = int(current['quantity'])
@@ -129,7 +159,7 @@ def from_pages(pages):
                 if re.search(r'\d+\.\d{2}', _cell(row, unit_left, 100000)):
                     raise ValueError('发现未归属的金额行，请手动核对折扣或漏项')
                 current['product'] += _cell(row, 0, spec_left)
-                current['spec'] += _cell(row, spec_left, unit_left)
+                current['spec'] += _cell(row, spec_left, unit_left, spaced=True)
     if len(numbers) != 1 or len(totals) != 1 or len(dates) > 1:
         raise ValueError('票号或价税合计存在缺失、冲突')
     result.update(invoice_no=numbers.pop(), total=float(totals.pop().replace(',','')))

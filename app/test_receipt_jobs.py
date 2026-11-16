@@ -1,6 +1,8 @@
 """生成任务的调度、输入边界和失败处理；真实 ruku 在浏览器验收中执行。"""
 import json
 import hashlib
+from datetime import datetime
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -8,6 +10,7 @@ import unittest
 import threading
 import urllib.error
 import urllib.request
+from urllib.parse import unquote
 from unittest.mock import patch
 
 from server import Store, Handler, LocalServer
@@ -83,6 +86,11 @@ class ReceiptJobTests(unittest.TestCase):
         external_id = hashlib.sha256(str(external).encode()).hexdigest()[:24]
         with patch('receipt_jobs.subprocess.run', side_effect=self.fake_script):
             job = self.store.receipts.create([self.row['id']], background=False)
+        document = self.store.documents()[0]
+        receipt_time = datetime(2026, 11, 16, 14, 1, 2).timestamp()
+        statistics_time = datetime(2026, 11, 16, 14, 3, 4).timestamp()
+        os.utime(document['path'], (receipt_time, receipt_time))
+        os.utime(document['statistics']['path'], (statistics_time, statistics_time))
         server = LocalServer(('127.0.0.1', 0), Handler)
         server.store = self.store
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -93,6 +101,10 @@ class ReceiptJobTests(unittest.TestCase):
             with opener.open(base + job['document_id']) as response:
                 self.assertEqual(response.read(), Path(job['output']).read_bytes())
                 self.assertIn('wordprocessingml.document', response.headers['Content-Type'])
+                self.assertTrue(unquote(response.headers['Content-Disposition']).endswith('入库单_12.34元_2026-11-16.docx'))
+            with opener.open(base + document['statistics']['id']) as response:
+                self.assertEqual(response.read(), Path(document['statistics']['path']).read_bytes())
+                self.assertTrue(unquote(response.headers['Content-Disposition']).endswith('统计表格_12.34元_2026-11-16.docx'))
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 opener.open(base + external_id)
             self.assertEqual(caught.exception.code, 404)

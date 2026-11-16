@@ -17,7 +17,7 @@ import threading
 from receipt_layout import clean_receipt, blank_receipt_fields
 from statistics_table import rows_from_invoices, validate_rows, write_statistics
 from invoice_company import seller_from_text, company_from_pdf, company_needs_repair
-from invoice_extract import repair_extraction, ExtractionRepairError, check_invoice
+from invoice_extract import repair_extraction, ExtractionRepairError, check_invoice, discounted_items
 
 MAX_RECEIPTS = 5
 LAYOUT_VERSION = 3
@@ -25,6 +25,11 @@ LAYOUT_VERSION = 3
 
 def timestamp():
     return datetime.now().astimezone().isoformat(timespec='microseconds')
+
+
+def document_download_name(kind, total_cents, saved_at):
+    amount = '金额未填' if total_cents is None else f'{Decimal(total_cents) / 100:.2f}元'
+    return f'{kind}_{amount}_{datetime.fromtimestamp(saved_at):%Y-%m-%d}.docx'
 
 
 class ReceiptJobs:
@@ -161,6 +166,8 @@ class ReceiptJobs:
             items = inv.get('items') or [{}]
             try:
                 check_invoice(inv)
+                if len(items) > 1 and inv.get('discounts'):
+                    items = discounted_items(inv)
                 complete = True
             except ValueError:
                 complete = False
@@ -438,9 +445,23 @@ class ReceiptJobs:
             path = Path(job['output']).resolve()
             if not path.is_relative_to(self.directory.resolve()) or not path.is_file():
                 continue
+            stat = path.stat()
+            total_cents = job['total_cents']
             statistics = self._statistics_path(job)
-            attachment = dict(id=job['statistics_document_id'], name=statistics.name, path=str(statistics), size=statistics.stat().st_size) if job.get('statistics_document_id') and statistics.is_file() else None
-            result.append(dict(id=job['document_id'], name=path.name, path=str(path), relative=str(path.relative_to(self.store.root)) if path.is_relative_to(self.store.root) else str(path), size=path.stat().st_size, generated=True, created_at=job['created_at'], invoice_count=job['invoice_count'], item_count=job['item_count'], total_cents=job['total_cents'], job_id=job['id'], statistics=attachment, statistics_error=job.get('statistics_error', '')))
+            attachment = None
+            if job.get('statistics_document_id') and statistics.is_file():
+                statistics_stat = statistics.stat()
+                attachment = dict(id=job['statistics_document_id'], name=statistics.name, path=str(statistics),
+                                  size=statistics_stat.st_size,
+                                  download_name=document_download_name('统计表格', total_cents, statistics_stat.st_mtime))
+            result.append(dict(
+                id=job['document_id'], name=path.name, path=str(path),
+                relative=str(path.relative_to(self.store.root)) if path.is_relative_to(self.store.root) else str(path),
+                size=stat.st_size, download_name=document_download_name('入库单', total_cents, stat.st_mtime),
+                generated=True, created_at=job['created_at'], invoice_count=job['invoice_count'],
+                item_count=job['item_count'], total_cents=total_cents, job_id=job['id'], statistics=attachment,
+                statistics_error=job.get('statistics_error', '')
+            ))
         return result
 
     def create(self, ids, background=True):
@@ -531,6 +552,14 @@ class ReceiptJobs:
                         raise ValueError('识别结果包含相同票号，请核对后重试')
                     job['item_count'] = sum(len(inv['items']) for inv in invoices)
                     job['total_cents'] = sum(int(Decimal(str(inv['total'])) * 100) for inv in invoices)
+                    if any(len(inv['items']) > 1 and inv.get('discounts') for inv in invoices):
+                        # 填表脚本只读取商品金额及税额。正式数据保留原票金额和单独折扣行。
+                        render_data = data.with_name('invoice_data_render.json')
+                        render_invoices = [{**inv, 'items': discounted_items(inv)} if len(inv['items']) > 1 else inv
+                                           for inv in invoices]
+                        render_data.write_text(json.dumps(render_invoices, ensure_ascii=False, indent=2), encoding='utf-8')
+                        commands[2] = [str(scripts / 'fill_receipt.py'), '--template', str(self.template),
+                                       '--data', str(render_data), '--output', job['output']]
                     step['summary'] = f"识别 {len(invoices)} 张发票、{job['item_count']} 项商品，合计 ¥{job['total_cents']/100:.2f}"
                 elif index == 1:
                     step['summary'] = f"已重命名 {job['invoice_count']} 份发票副本"

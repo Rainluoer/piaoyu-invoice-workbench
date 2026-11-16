@@ -54,7 +54,7 @@ function fixture(fail=false){
   assert.equal(failed.printed.length,0);
   assert.match(failed.elements['#print-status'].textContent,/原票已变化/);
   const app=fs.readFileSync(path.join(__dirname,'web/app.js'),'utf8');
-  const block=app.slice(app.indexOf('function printSelectedInvoices('),app.indexOf('async function exportSelectedZip('));
+  const block=app.slice(app.indexOf('function printSelectedInvoices('),app.indexOf('async function downloadSelectedInvoices('));
   const ids=Array.from({length:10},(_,i)=>'ticket-'+i),selected=new Set(ids),calls=[],messages=[];
   const popup={};
   const context=vm.createContext({selected,busy:false,window:{open:(...args)=>{calls.push(args);return popup;}},toast:message=>messages.push(message)});

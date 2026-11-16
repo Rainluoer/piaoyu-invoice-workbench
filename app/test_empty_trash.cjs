@@ -7,7 +7,7 @@ const source = fs.readFileSync(path.join(__dirname, 'web', 'app.js'), 'utf8');
 const blocks = [
   source.slice(source.indexOf('function updateTrashControls('), source.indexOf('async function deleteDuplicates(')),
   source.slice(source.indexOf('async function emptyTrash('), source.indexOf('async function deleteSelectedInvoices(')),
-  source.slice(source.indexOf('function confirmInvoiceDeletion('), source.indexOf('async function exportSelectedZip('))
+  source.slice(source.indexOf('function confirmInvoiceDeletion('), source.indexOf('async function downloadSelectedInvoices('))
 ].join('\n');
 
 function fixture() {

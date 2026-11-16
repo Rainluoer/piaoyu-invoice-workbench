@@ -40,10 +40,17 @@ function renderStats(){
 }
 function renderRows(){const rows=filtered();const pages=Math.max(1,Math.ceil(rows.length/pageSize));page=Math.min(page,pages);const visible=rows.slice((page-1)*pageSize,page*pageSize);$('#list-title').innerHTML=`${esc(view==='all'?'全部发票':viewNames[view])} <span id="list-count">${rows.length}</span>`;$('#status-column-header').textContent=view==='duplicates'?'副本历史状态':'报销状态';$('#invoice-panel table').classList.toggle('duplicates-table',view==='duplicates');$('#list-caption').classList.toggle('hidden',view!=='duplicates');$('#list-caption').textContent='按相同票号或文件内容识别。原票保留在对应报销状态中，重复副本不计入统计。';$$('[data-batch]').forEach(button=>{button.disabled=view==='duplicates';button.classList.toggle('hidden',view==='duplicates');button.title=view==='duplicates'?'请打开原票修改报销状态':'';});$('#invoice-rows').innerHTML=visible.length?visible.map(r=>`<tr data-row="${r.id}" class="${selected.has(r.id)?'selected':''}"><td class="checkbox-cell"><input type="checkbox" data-select="${r.id}" aria-label="选择${esc(r.title)}" ${selected.has(r.id)?'checked':''}></td><td><div class="invoice-info"><span class="file-icon">${icon('document')}<small>${r.filename.toLowerCase().endsWith('.pdf')?'PDF':'IMG'}</small></span><div class="invoice-text"><div class="invoice-title" title="${esc(r.title)}">${esc(r.title)}${r.duplicate_of?'<span class="mini-badge duplicate">重复</span>':''}${r.missing?'<span class="mini-badge">文件缺失</span>':''}</div><div class="invoice-meta"><button class="category-tag category-edit" type="button" data-edit-category="${r.id}" aria-label="修改发票类型：${esc(r.title)}" title="点击修改发票类型">${esc(r.category)}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m15 5 4 4M4 20l4-1 12-12-4-4L4 15z"/></svg></button> · ${esc(r.invoice_no||'票号待填写')}</div></div></div></td><td>${esc(r.date)||'<span class="muted">待填写</span>'}</td><td class="align-right amount">${fullMoney(r.amount_cents)}</td><td>${statusBadge(r.status)}</td><td class="project-name" title="${esc(r.project)}">${r.project?esc(r.project):'<span class="muted">未分配</span>'}</td><td class="align-right"><div class="row-actions"><button class="icon-button" data-detail="${r.id}" aria-label="查看票据详情">↗</button>${view==='duplicates'?`<button class="icon-button danger" data-delete-duplicate="${r.id}" aria-label="删除此重复项" title="移入回收站">${icon('trash')}</button>`:''}</div></td></tr>`).join(''):`<tr><td colspan="7"><div class="empty-state">${icon('search')}<h3>无匹配票据</h3><p>请调整筛选条件或导入发票。</p></div></td></tr>`;const effective=rows.filter(r=>!r.duplicate_of&&!r.missing),unknown=effective.filter(r=>r.amount_cents==null).length;$('#table-summary').textContent=view==='duplicates'?`重复副本 ${rows.length} 张 · 不计入报销汇总`:`共 ${rows.length} 张 · 去重后已识别金额 ¥ ${money(sum(effective))}${unknown?` · ${unknown} 张金额待填写`:''}`;$('#page-label').textContent=`${page} / ${pages}`;$('#prev-page').disabled=page<=1;$('#next-page').disabled=page>=pages;$('#select-all').checked=rows.length>0&&rows.every(r=>selected.has(r.id));$('#select-all').indeterminate=rows.some(r=>selected.has(r.id))&&!$('#select-all').checked;$('#batch-bar').classList.toggle('hidden',!selected.size);$('#selected-count').textContent=`已选择 ${selected.size} 张`;updateDuplicateControls();$('#project-filter').classList.toggle('hidden',projectFilter===null);$('#project-filter').innerHTML=projectFilter===null?'':`当前分类：${esc(projectFilter)}<button id="remove-project-filter">清除 ×</button>`;}
 function updateDuplicateControls(){
+  const undo=state.batch_undo;
+  const undoButton=$('#undo-batch-button');
+  undoButton.classList.toggle('hidden',!undo);
+  undoButton.disabled=busy||!undo;
+  undoButton.title=undo?`恢复 ${undo.count} 张票据原来的报销状态`:'';
   $('#delete-duplicates-button').classList.toggle('hidden',view!=='duplicates');
   $('#trash-button').classList.remove('hidden');
   $('#delete-selected-button').disabled=busy||!selected.size;
-  $('#export-zip-button').disabled=busy||!selected.size;
+  const downloadButton=$('#export-zip-button');
+  downloadButton.disabled=busy||!selected.size;
+  downloadButton.textContent=selected.size===1?'下载原件':'导出 ZIP';
   $('#print-selected-button').disabled=busy||!selected.size;
   $$('[data-batch]').forEach(button=>{button.disabled=busy||view==='duplicates';});
   $('#delete-duplicates-button').disabled=busy||!selected.size;
@@ -99,6 +106,30 @@ async function deleteSelectedInvoices(){
   try{const result=await api('/api/delete-invoices',{ids});selected.clear();await load();toast(`已将 ${result.deleted} 张票据移入回收站，可随时恢复`);}
   finally{busy=false;updateDuplicateControls();}
 }
+async function markSelectedInvoices(status){
+  if(busy||!selected.size)return;
+  if(view==='duplicates'){toast('请打开原票修改报销状态');return;}
+  const ids=[...selected];
+  busy=true;updateDuplicateControls();
+  try{
+    const result=await api('/api/update',{ids,patch:{status},remember_batch:true});
+    selected.clear();await load();
+    toast(result.updated?`已更新 ${result.updated} 张票据的报销状态，可撤销`:'选中票据已是该状态');
+  }finally{busy=false;updateDuplicateControls();}
+}
+async function undoBatch(){
+  const undo=state.batch_undo;
+  if(busy||!undo)return;
+  busy=true;updateDuplicateControls();
+  try{
+    const result=await api('/api/undo-batch',{token:undo.token});
+    await load();
+    toast(`已恢复 ${result.undone} 张票据原来的报销状态`);
+  }catch(error){
+    await load().catch(()=>{});
+    throw error;
+  }finally{busy=false;updateDuplicateControls();}
+}
 function confirmInvoiceDeletion(count,permanent=false){
   const dialog=$('#delete-confirm-dialog');
   if(dialog.open)return Promise.resolve(false);
@@ -118,16 +149,24 @@ function printSelectedInvoices(){
   if(!popup){toast('请允许工作台打开打印窗口后重试');return;}
   popup.opener=null;
 }
-async function exportSelectedZip(){
+async function downloadSelectedInvoices(){
   if(busy||!selected.size)return;
-  const ids=[...selected];busy=true;updateDuplicateControls();
+  const ids=[...selected];
+  const single=ids.length===1;
+  busy=true;updateDuplicateControls();
   try{
-    const response=await fetch('/api/export-zip',{method:'POST',headers:{'Content-Type':'application/json','X-Workbench-Key':state.key},body:JSON.stringify({ids})});
-    if(!response.ok){const data=await response.json();throw Error(data.error||'导出失败');}
+    const response=single
+      ? await fetch(`/api/file/${encodeURIComponent(ids[0])}?download=1`)
+      : await fetch('/api/export-zip',{method:'POST',headers:{'Content-Type':'application/json','X-Workbench-Key':state.key},body:JSON.stringify({ids})});
+    if(!response.ok){const data=await response.json();throw Error(data.error||'下载失败');}
     const url=URL.createObjectURL(await response.blob()),link=document.createElement('a');
     const filename=response.headers.get('Content-Disposition')?.match(/filename\*=UTF-8''([^;]+)/i);
-    link.href=url;link.download=filename?decodeURIComponent(filename[1]):`发票_${ids.length}张_${new Date().toLocaleDateString('sv-SE')}.zip`;link.click();
-    setTimeout(()=>URL.revokeObjectURL(url),3000);toast(`已打包 ${ids.length} 张票据，正在下载 ZIP`);
+    const fallback=single
+      ? state.invoices.find(row=>row.id===ids[0])?.filename||'发票原件'
+      : `发票_${ids.length}张_${new Date().toLocaleDateString('sv-SE')}.zip`;
+    link.href=url;link.download=filename?decodeURIComponent(filename[1]):fallback;link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),3000);
+    toast(single?'正在下载原件':`已打包 ${ids.length} 张票据，正在下载 ZIP`);
   }finally{busy=false;updateDuplicateControls();}
 }
 function render(){renderStats();const extra=['projects','documents','settings'].includes(view);$('#invoice-panel').classList.toggle('hidden',extra);$('#extra-panel').classList.toggle('hidden',!extra);$('#overview-grid').classList.toggle('hidden',view!=='all');$$('.nav-item').forEach(el=>{el.classList.toggle('active',el.dataset.view===view);el.setAttribute('aria-current',el.dataset.view===view?'page':'false');});$('#breadcrumb-title').textContent=viewNames[view];$('#page-intro').classList.toggle('hidden',view==='all');$('.page-heading').classList.toggle('actions-only',view==='all');$('#page-title').textContent=viewNames[view];if(extra)renderExtra();else renderRows();const scan=state.last_scan?new Date(state.last_scan).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'尚未扫描';$('#scan-caption').textContent=`上次扫描 ${scan} · 原票 ${state.invoices.filter(r=>!r.duplicate_of).length} 张 · 重复副本 ${state.invoices.filter(r=>r.duplicate_of).length} 张`;}
@@ -138,7 +177,7 @@ function closeDetail(){$('#drawer').classList.add('hidden');$('#drawer-backdrop'
 async function scan(){if(busy)return;busy=true;$('#scan-button').disabled=true;$('#scan-button').innerHTML=icon('refresh')+'正在扫描…';try{const result=await api('/api/scan',{});await load();toast(`扫描完成：新增 ${result.added} 张，更新 ${result.updated} 张${result.errors.length?`，${result.errors.length} 个文件读取失败：\n${result.errors.slice(0,2).join('\n')}`:''}`);}catch(e){report(e);}finally{busy=false;$('#scan-button').disabled=false;$('#scan-button').innerHTML=icon('refresh')+'扫描本地目录';}}
 async function importFiles(files){if(busy){toast('正在处理文件，请稍候');return;}busy=true;$('#import-button').disabled=true;let added=0,unchanged=0,errors=[];try{for(const [index,file] of [...files].entries()){if(file.size>40*1024*1024){errors.push(`${file.name} 超过 40 MB`);continue;}toast(`正在导入 ${index+1} / ${files.length}：${file.name}`);try{const content=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result.split(',')[1]);reader.onerror=()=>reject(Error('文件读取失败'));reader.readAsDataURL(file);});const result=await api('/api/import',{name:file.name,content});added+=result.added;unchanged+=result.unchanged;}catch(e){errors.push(`${file.name}：${e.message}`);}}await load();toast(`导入完成：新增 ${added} 张，已存在 ${unchanged} 张${errors.length?'\n'+errors.slice(0,3).join('\n'):''}`);}finally{busy=false;$('#import-button').disabled=false;$('#file-input').value='';}}
 async function backup(){const response=await fetch('/api/backup',{method:'POST',headers:{'Content-Type':'application/json','X-Workbench-Key':state.key},body:'{}'});if(!response.ok){const data=await response.json();throw Error(data.error);}const url=URL.createObjectURL(await response.blob());const a=document.createElement('a');a.href=url;a.download=`发票台账备份_${new Date().toISOString().slice(0,10)}.sqlite3`;a.click();setTimeout(()=>URL.revokeObjectURL(url),3000);toast('备份已保存到工作台 data/backups，并开始下载');}
-document.addEventListener('click',async e=>{const t=e.target.closest('button,a');try{if(t?.dataset.editCategory){openCategoryEditor(t.dataset.editCategory);return;}if(t?.dataset.deleteDuplicate){await deleteDuplicates([t.dataset.deleteDuplicate]);return;}if(t?.dataset.restoreDuplicate){await restoreDuplicate(t.dataset.restoreDuplicate);return;}if(t?.dataset.original){openDetail(t.dataset.original);return;}if(t?.dataset.view){switchView(t.dataset.view);return;}if(t?.dataset.stat){switchView(t.dataset.stat);return;}if(t?.dataset.batch){if(view==='duplicates'){toast('请打开原票修改报销状态');return;}const ids=[...selected];await api('/api/update',{ids,patch:{status:t.dataset.batch}});selected.clear();await load();toast(`已更新 ${ids.length} 张票据的报销状态`);return;}if(t?.dataset.group){projectFilter=t.dataset.group;view='all';page=1;selected.clear();$('#search').value='';$('#category-filter').value='';$('#status-filter').value='';render();return;}switch(t?.id){case 'delete-selected-button':await deleteSelectedInvoices();return;case 'export-zip-button':await exportSelectedZip();return;case 'print-selected-button':printSelectedInvoices();return;case 'delete-duplicates-button':await deleteDuplicates([...selected]);return;case 'trash-button':renderTrash();$('#trash-dialog').showModal();return;case 'close-trash':$('#trash-dialog').close();return;case 'empty-trash-button':await emptyTrash();return;case 'preview-prev':case 'preview-next':{const row=state.invoices.find(r=>r.id===activeId);detailPage+=t.id==='preview-next'?1:-1;$('#pdf-preview').src=`/api/preview/${activeId}?page=${detailPage}`;$('#pdf-preview').alt=`发票原件第 ${detailPage} 页`;$('#zoom-preview').href=`/api/preview/${activeId}?page=${detailPage}`;$('#preview-page').textContent=`${detailPage} / ${row.page_count}`;$('#preview-prev').disabled=detailPage<=1;$('#preview-next').disabled=detailPage>=row.page_count;return;}case 'scan-button':await scan();return;case 'import-button':$('#file-input').click();return;case 'export-button':{const ids=selected.size?[...selected]:filtered().map(r=>r.id);if(!ids.length){toast('没有可导出的票据');return;}location.href='/api/export?ids='+encodeURIComponent(ids.join(','));toast(`正在导出 ${ids.length} 张票据的台账`);return;}case 'prev-page':page--;renderRows();return;case 'next-page':page++;renderRows();return;case 'clear-selection':selected.clear();renderRows();return;case 'close-drawer':closeDetail();return;case 'help-button':$('#help-dialog').showModal();return;case 'close-help':$('#help-dialog').close();return;case 'remove-project-filter':projectFilter=null;renderRows();return;case 'open-folder-button':await api('/api/open-folder',{});return;case 'backup-button':await backup();return;case 'shutdown-button':await api('/api/shutdown',{});toast('本地服务已停止，可双击启动脚本重新打开');return;}const row=e.target.closest('[data-row]');if(row&&!e.target.closest('input'))openDetail(row.dataset.row);}catch(error){report(error);}});
+document.addEventListener('click',async e=>{const t=e.target.closest('button,a');try{if(t?.dataset.editCategory){openCategoryEditor(t.dataset.editCategory);return;}if(t?.dataset.deleteDuplicate){await deleteDuplicates([t.dataset.deleteDuplicate]);return;}if(t?.dataset.restoreDuplicate){await restoreDuplicate(t.dataset.restoreDuplicate);return;}if(t?.dataset.original){openDetail(t.dataset.original);return;}if(t?.dataset.view){switchView(t.dataset.view);return;}if(t?.dataset.stat){switchView(t.dataset.stat);return;}if(t?.dataset.batch){await markSelectedInvoices(t.dataset.batch);return;}if(t?.dataset.group){projectFilter=t.dataset.group;view='all';page=1;selected.clear();$('#search').value='';$('#category-filter').value='';$('#status-filter').value='';render();return;}switch(t?.id){case 'undo-batch-button':await undoBatch();return;case 'delete-selected-button':await deleteSelectedInvoices();return;case 'export-zip-button':await downloadSelectedInvoices();return;case 'print-selected-button':printSelectedInvoices();return;case 'delete-duplicates-button':await deleteDuplicates([...selected]);return;case 'trash-button':renderTrash();$('#trash-dialog').showModal();return;case 'close-trash':$('#trash-dialog').close();return;case 'empty-trash-button':await emptyTrash();return;case 'preview-prev':case 'preview-next':{const row=state.invoices.find(r=>r.id===activeId);detailPage+=t.id==='preview-next'?1:-1;$('#pdf-preview').src=`/api/preview/${activeId}?page=${detailPage}`;$('#pdf-preview').alt=`发票原件第 ${detailPage} 页`;$('#zoom-preview').href=`/api/preview/${activeId}?page=${detailPage}`;$('#preview-page').textContent=`${detailPage} / ${row.page_count}`;$('#preview-prev').disabled=detailPage<=1;$('#preview-next').disabled=detailPage>=row.page_count;return;}case 'scan-button':await scan();return;case 'import-button':$('#file-input').click();return;case 'export-button':{const ids=selected.size?[...selected]:filtered().map(r=>r.id);if(!ids.length){toast('没有可导出的票据');return;}location.href='/api/export?ids='+encodeURIComponent(ids.join(','));toast(`正在导出 ${ids.length} 张票据的台账`);return;}case 'prev-page':page--;renderRows();return;case 'next-page':page++;renderRows();return;case 'clear-selection':selected.clear();renderRows();return;case 'close-drawer':closeDetail();return;case 'help-button':$('#help-dialog').showModal();return;case 'close-help':$('#help-dialog').close();return;case 'remove-project-filter':projectFilter=null;renderRows();return;case 'open-folder-button':await api('/api/open-folder',{});return;case 'backup-button':await backup();return;case 'shutdown-button':await api('/api/shutdown',{});toast('本地服务已停止，可双击启动脚本重新打开');return;}const row=e.target.closest('[data-row]');if(row&&!e.target.closest('input'))openDetail(row.dataset.row);}catch(error){report(error);}});
 document.addEventListener('change',e=>{if(e.target.dataset.select){e.target.checked?selected.add(e.target.dataset.select):selected.delete(e.target.dataset.select);renderRows();}if(e.target.id==='select-all'){filtered().forEach(r=>e.target.checked?selected.add(r.id):selected.delete(r.id));renderRows();}if(['category-filter','status-filter','sort-filter'].includes(e.target.id)){page=1;selected.clear();renderRows();}if(e.target.id==='file-input')importFiles(e.target.files).catch(report);});
 $('#search').addEventListener('input',()=>{page=1;selected.clear();renderRows();});
 $('#drawer-backdrop').addEventListener('click',closeDetail);

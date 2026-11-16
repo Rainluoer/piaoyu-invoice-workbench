@@ -4,6 +4,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from urllib.parse import urlsplit
 from invoice_company import company_needs_repair
+from invoice_extract import discounted_items
 
 CATEGORIES = ('试剂', '仪器', '耗材')
 FIELDS = ('category', 'name', 'purpose', 'company', 'url', 'price', 'safety', 'notes')
@@ -37,6 +38,8 @@ def rows_from_invoices(invoices, sellers=None):
     rows = []
     for index, inv in enumerate(invoices, 1):
         items = inv.get('items') or []
+        if len(items) > 1 and inv.get('discounts'):
+            items = discounted_items(inv)
         for number, item in enumerate(items, 1):
             amount = inv.get('total') if len(items) == 1 else None
             if amount is None and item.get('amount') is not None:
