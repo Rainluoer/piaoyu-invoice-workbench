@@ -105,6 +105,7 @@ python -m pip install -r requirements-dev.txt
 cd app
 python -m unittest discover -p "test_*.py" -v
 node test_ui_filters.cjs
+node test_import_history.cjs
 node test_themes.cjs
 node test_receipt_polling.cjs
 node test_empty_trash.cjs
