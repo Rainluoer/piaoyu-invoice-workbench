@@ -29,6 +29,7 @@ from invoice_company import seller_from_text, company_from_pdf, company_needs_re
 from pdf_layout import layout_text
 from invoice_extract import from_pages
 from invoice_category import classify_invoice
+from rail_travel import rail_travel_details
 from pdf_layout import layout_lines
 from invoice_print import page_count as print_page_count, render_page as render_print_page
 
@@ -436,7 +437,9 @@ class Store:
                     numbers.setdefault(row['invoice_no'], row['id'])
                 row['missing'] = not Path(row['path']).is_file()
                 row['needs_review'] = bool(row['warning']) or row['amount_cents'] is None or not row['invoice_no'] or not row['date']
-                row.pop('text')
+                text = row.pop('text')
+                if row['category'] == '铁路客票':
+                    row['rail_travel'] = rail_travel_details(text)
             last = self.db.execute("SELECT value FROM meta WHERE key='last_scan'").fetchone()
             events = [dict(r) for r in self.db.execute('SELECT e.*,i.title FROM events e LEFT JOIN invoices i ON i.id=e.invoice_id ORDER BY e.id DESC LIMIT 30')]
             trash = [dict(r) for r in self.db.execute("SELECT id,title,filename,path,invoice_no,status,deleted_at FROM invoices WHERE deleted_at<>'' AND purged_at='' ORDER BY deleted_at DESC,id")]
@@ -937,7 +940,7 @@ class Handler(BaseHTTPRequestHandler):
                     fields = [row['title'], row['invoice_no'], row['date'], '' if row['amount_cents'] is None else f"{row['amount_cents']/100:.2f}", row['category'], row['status'], row['project'], row['seller'], row['notes'], row['path'], '是' if row['duplicate_of'] else '否']
                     writer.writerow([cell(v) for v in fields])
                 return self.send(b'\xef\xbb\xbf' + out.getvalue().encode(), 'text/csv; charset=utf-8', filename='发票台账.csv')
-            assets = {'/': 'index.html', '/print.html': 'print.html', '/print.js': 'print.js', '/print.css': 'print.css', '/app.js': 'app.js', '/receipts.js': 'receipts.js', '/statistics.js': 'statistics.js', '/folders.js': 'folders.js', '/categories.js': 'categories.js', '/themes.js': 'themes.js', '/themes.css': 'themes.css', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg'}
+            assets = {'/': 'index.html', '/print.html': 'print.html', '/print.js': 'print.js', '/print.css': 'print.css', '/app.js': 'app.js', '/receipts.js': 'receipts.js', '/statistics.js': 'statistics.js', '/folders.js': 'folders.js', '/categories.js': 'categories.js', '/trips.js': 'trips.js', '/themes.js': 'themes.js', '/themes.css': 'themes.css', '/style.css': 'style.css', '/favicon.svg': 'favicon.svg'}
             if route in assets:
                 path = BASE / 'web' / assets[route]
                 return self.send(path.read_bytes(), mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
