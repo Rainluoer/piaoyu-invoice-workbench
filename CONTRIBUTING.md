@@ -7,7 +7,7 @@
 1. 在 GitHub 点击 Fork，将仓库复制到自己的账号。
 2. 克隆自己的 Fork，创建分支，例如 `git switch -c fix/receipt-preview`。
 3. 安装 `requirements-dev.txt`，修改源码；用合成或已经充分脱敏的样本复现问题。
-4. 在 `app` 目录执行 README 中的 Python 和 Node 测试，必要时补充能复现问题的回归测试。
+4. 按[使用说明中的测试命令](docs/USAGE.md#一起改进)运行回归，必要时补充能复现问题的测试。
 5. 检查 `git diff`、`git status`，确认没有真实票据、数据库、日志、路径截图或密钥。
 6. 提交并推送分支，然后在 GitHub 点击 **Compare & pull request**，目标为 `Rainluoer/piaoyu-invoice-workbench` 的 `main` 分支。
 
