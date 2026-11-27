@@ -1,4 +1,5 @@
 """只删除指定占位文字和尾部空段落，保证金额和其他文档部件不受影响。"""
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -6,6 +7,9 @@ from zipfile import ZipFile
 
 from docx import Document
 from receipt_layout import clean_receipt
+
+TEMPLATE = Path(__file__).parent / 'assets' / '入库单模板.docx'
+SIGNATURE = '采购：\t验收：\t保管：\t审核：'
 
 
 class ReceiptLayoutTests(unittest.TestCase):
@@ -49,14 +53,33 @@ class ReceiptLayoutTests(unittest.TestCase):
             self.assertEqual(before, output.read_bytes())
 
     def test_workbench_template_has_no_presets_or_trailing_empty_paragraphs(self):
-        path = Path(__file__).parent / 'assets' / '入库单模板.docx'
-        doc = Document(path)
+        doc = Document(TEMPLATE)
         self.assertEqual(len(doc.tables[0].rows), 3)
         self.assertEqual(doc.tables[0].cell(1, 0).text, '')
         self.assertEqual(doc.tables[0].cell(2, 0).text, '')
         self.assertIn('项目（课题）名称及代码', doc.tables[0].cell(0, 0).text)
         self.assertTrue(doc.paragraphs[-1].text.strip())
         self.assertEqual(len(doc.tables[1].rows), 10)
+        self.assertEqual(doc.tables[1].rows[-1].cells[1].text, SIGNATURE)
+
+    def test_old_unsigned_receipt_gets_audit_field_without_losing_download_date(self):
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / 'old.docx'
+            old_signature = '采购：     验收：     保管：'
+            for text in (old_signature, old_signature + ' 姓名'):
+                with self.subTest(text=text):
+                    doc = Document(TEMPLATE)
+                    table = doc.tables[1]
+                    table.cell(1, 7).text = '10.00'
+                    table.rows[-1].cells[1].text = text
+                    doc.save(path)
+                    os.utime(path, (1760000000, 1760000000))
+                    self.assertEqual(clean_receipt(path, blank_rows_from=TEMPLATE), text == old_signature)
+                    updated = Document(path).tables[1]
+                    self.assertEqual(updated.rows[-1].cells[1].text, SIGNATURE if text == old_signature else text)
+                    self.assertEqual(updated.cell(1, 7).text, '10.00')
+                    self.assertEqual(path.stat().st_mtime, 1760000000)
+                    self.assertFalse(clean_receipt(path, blank_rows_from=TEMPLATE))
 
     def test_old_layout_restores_two_blank_project_rows(self):
         with TemporaryDirectory() as folder:
@@ -66,7 +89,7 @@ class ReceiptLayoutTests(unittest.TestCase):
             header.cell(0, 0).text = '项目（课题）名称及代码：'
             doc.add_paragraph('末尾注释')
             doc.save(path)
-            clean_receipt(path, blank_rows_from=Path(__file__).parent / 'assets' / '入库单模板.docx')
+            clean_receipt(path, blank_rows_from=TEMPLATE)
             updated = Document(path)
             self.assertEqual(len(updated.tables[0].rows), 3)
             self.assertEqual(updated.tables[0].cell(1, 0).text, '')

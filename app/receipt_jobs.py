@@ -20,7 +20,7 @@ from invoice_company import seller_from_text, company_from_pdf, company_needs_re
 from invoice_extract import repair_extraction, ExtractionRepairError, check_invoice, discounted_items
 
 MAX_RECEIPTS = 5
-LAYOUT_VERSION = 3
+LAYOUT_VERSION = 4
 
 
 def timestamp():

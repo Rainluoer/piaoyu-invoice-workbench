@@ -1,4 +1,4 @@
-"""仅修正入库单的预设项目文字与尾部空段落，保留其他 OOXML 部件。"""
+"""修正工作台入库单的固定版式，保留其他 OOXML 部件。"""
 from pathlib import Path
 from copy import deepcopy
 import os
@@ -10,9 +10,22 @@ NS = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
 W = '{' + NS['w'] + '}'
 
 
+def _signature_paragraph(document):
+    paragraphs = document.xpath(
+        'w:body/w:tbl[2]/w:tr[last()]/w:tc[2][w:tcPr/w:gridSpan/@w:val="8"]/w:p',
+        namespaces=NS,
+    )
+    return paragraphs[0] if len(paragraphs) == 1 else None
+
+
+def _signature_text(paragraph):
+    return ''.join(''.join(paragraph.xpath('.//w:t/text()', namespaces=NS)).split())
+
+
 def clean_receipt(source, target=None, blank_rows_from=None):
     source = Path(source)
     target = Path(target) if target else source
+    original_times = source.stat() if source == target else None
     with ZipFile(source) as package:
         entries = [(info, package.read(info.filename)) for info in package.infolist()]
     xml = next(data for info, data in entries if info.filename == 'word/document.xml')
@@ -30,14 +43,28 @@ def clean_receipt(source, target=None, blank_rows_from=None):
                 for line_break in row.xpath('.//w:br', namespaces=NS):
                     line_break.getparent().remove(line_break)
                 changed = True
-        # 兼容之前已删掉这两行的工作台文件，恢复为模板里的两个空行。
-        if len(header.findall('w:tr', NS)) == 1 and blank_rows_from:
-            with ZipFile(blank_rows_from) as template:
-                reference = etree.fromstring(template.read('word/document.xml'))
+    restore_header = header is not None and len(header.findall('w:tr', NS)) == 1
+    signature = _signature_paragraph(document)
+    # 仅替换旧的空白签名栏，保留已填写的签字或插入的签名对象。
+    restore_signature = (signature is not None and _signature_text(signature) == '采购：验收：保管：'
+                         and all(child.tag in {W + 'pPr', W + 'r'} for child in signature)
+                         and all(child.tag in {W + 'rPr', W + 't', W + 'tab'}
+                                 for child in signature.findall('w:r/*', NS)))
+    if blank_rows_from and (restore_header or restore_signature):
+        with ZipFile(blank_rows_from) as template:
+            reference = etree.fromstring(template.read('word/document.xml'))
+        if restore_header:
+            # 兼容之前已删掉这两行的工作台文件，恢复为模板里的两个空行。
             reference_header = reference.find('w:body/w:tbl', NS)
             for row in reference_header.findall('w:tr', NS)[1:3]:
                 header.append(deepcopy(row))
                 changed = True
+        if restore_signature:
+            reference_signature = _signature_paragraph(reference)
+            if reference_signature is None or _signature_text(reference_signature) != '采购：验收：保管：审核：':
+                raise ValueError('入库单模板缺少完整的签名栏')
+            signature[:] = [deepcopy(child) for child in reference_signature]
+            changed = True
     # 尾部的空白大字号段落会被 Word 排到新页；不触碰正文、图形或分节。
     for element in reversed(list(body)):
         if element.tag == W + 'sectPr':
@@ -59,6 +86,9 @@ def clean_receipt(source, target=None, blank_rows_from=None):
         with ZipFile(temporary, 'w') as package:
             for info, data in entries:
                 package.writestr(info, replacement if info.filename == 'word/document.xml' else data)
+        if original_times:
+            # 既有下载文件名使用成品时间，版式迁移保留该日期。
+            os.utime(temporary, ns=(original_times.st_atime_ns, original_times.st_mtime_ns))
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
